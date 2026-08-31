@@ -7,41 +7,57 @@ A command-line tool that scans public GitHub repositories for accidentally commi
 - Scans public repositories for a given GitHub username
 - Checks Git history for files matching environment/configuration patterns
 - Excludes common directories (like `node_modules`, `.git`, `dist`, etc.) to reduce noise
-- Provides direct links to the exact commit where each file appears
-- Validates commit hashes and URL-encodes paths to prevent 404 errors
+- Provides direct links to the exact commit where each file appears (with URL-encoding for safety)
+- Validates commit hash format (40 hex characters) to prevent broken links
 - Read-only operations only - does not modify any repositories
 - Optional GitHub token for higher API rate limits
+- Colored terminal output for better readability (ANSI colors, Windows VT processing enabled)
+- Memory-efficient stream-based processing
+- Modern C++20 standard
 
 ## Requirements
 
-- C++17 compiler (g++, clang++, or MSVC)
+- C++20 compiler (g++, clang++, or MSVC)
 - libcurl development library
-- jsoncpp development library
+- nlohmann/json (single header included in the repository)
 
 ### On Ubuntu/Debian
+
 ```bash
-sudo apt-get install build-essential libcurl4-openssl-dev libjsoncpp-dev
+sudo apt-get install build-essential libcurl4-openssl-dev
 ```
+
+*Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
 
 ### On CentOS/RHEL
+
 ```bash
 sudo yum groupinstall "Development Tools"
-sudo yum install libcurl-devel jsoncpp-devel
+sudo yum install libcurl-devel
 ```
+
+*Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
 
 ### On macOS (using Homebrew)
+
 ```bash
-brew install curl jsoncpp
+brew install curl
 ```
 
+*Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
+
 ### On Windows (using MSYS2)
+
 ```bash
-pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-libcurl mingw-w64-x86_64-jsoncpp
+pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-libcurl
 ```
+
+*Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
 
 ## Building
 
 ### Using CMake (recommended)
+
 ```bash
 mkdir build && cd build
 cmake ..
@@ -50,21 +66,32 @@ make
 ```
 
 ### Using the provided build script (Linux/macOS/WSL/MSYS2)
+
 ```bash
 chmod +x build.sh
 ./build.sh
 # The executable will be github_secrets_watcher in the current directory
 ```
 
+### Using the provided build script (Windows)
+
+```cmd
+build.bat
+# The executable will be github_secrets_watcher.exe in the current directory
+```
+
 ### Manual compilation
+
 ```bash
-g++ -std=c++17 -Wall -Wextra \
-    main.cpp github.cpp scanner.cpp utils.cpp \
-    $(pkg-config --cflags --libs libcurl jsoncpp) \
+g++ -std=c++20 -Wall -Wextra -Isrc \
+    src/main.cpp src/github.cpp src/scanner.cpp src/utils.cpp \
+    $(pkg-config --cflags --libs libcurl) \
     -o github_secrets_watcher
 ```
 
 ## Usage
+
+**From the build directory:**
 
 ```bash
 # Basic scan (no token needed for public repos)
@@ -78,22 +105,51 @@ g++ -std=c++17 -Wall -Wextra \
 --max-repos <NUM>  Maximum repositories to scan (default: all)
 ```
 
+**Note:** If you are not in the build directory, adjust the path to the executable accordingly.
+
 ## Example Output
 
-```
-[1/5] Scanning: my-web-app
-  📥 Cloning (depth=100)...
-  🔎 Scanning history...
-  ⚠️  Found 3 potential environment/configuration files:
-     - .env
-       🔗 https://github.com/username/my-web-app/blob/a1b2c3d4e5f6789012345678901234567890abcd/.env
-     - config/production.json
-       🔗 https://github.com/username/my-web-app/blob/f6e5d4c3b2a1098765432109876543210fedcba9/config/production.json
-     - settings.local.yml
-       🔗 https://github.com/username/my-web-app/blob/1a2b3c4d5e6f789012345678901234567890abcdef/settings.local.yml
+``` text
+[WARN] WARNING: This tool scans public repository history for educational purposes.
+         Only scan repositories you own or have permission to scan.
+         This tool performs read-only operations and does not modify any repositories.
+
+Do you want to continue? (y/N): y
+[INFO] Scanning public repositories for user: Gerald-Mathew
+[INFO] History depth: 100 commits
+[INFO] Maximum repos to scan: 5
+
+[INFO] Found 7 public repositories to scan.
+
+[1/7] Scanning: github-secrets-watcher
+[INFO] Cloning repository (depth=100)...
+[INFO] Scanning history...
+[OK] No potential environment files found in history.
+
+[2/7] Scanning: FlightReservation-CLI
+[INFO] Cloning repository (depth=100)...
+[INFO] Scanning history...
+[OK] No potential environment files found in history.
+
+[3/7] Scanning: CareConnect-Clinic-Appointment-System
+[INFO] Cloning repository (depth=100)...
+[INFO] Scanning history...
+[WARN] Found 5 potential environment/configuration files:
+     - .tmp-browser-check/playwright.config.js
+       [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0/.tmp-browser-check%2fplaywright.config.js
+     - client(First)/assets/js/config.js
+       [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/e537568aa7264bd1d27c6c5ba311e6440580873f/client%28First%29%2fassets%2fjs%2fconfig.js
+     - client/assets/js/config.js
+       [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/client%2fassets%2fjs%2fconfig.js
+     - client/eslint.config.js
+       [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/client%2feslint.config.js
+     - client/vite.config.js
+       [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/client%2fvite.config.js
+
+[INFO] Scan complete!
 ```
 
-Note: The links point to the exact commit where each file was found, allowing immediate location in the repository history.
+*Note: In a terminal that supports ANSI colors, the [WARN], [INFO], [OK], [FAIL], and [LINK] prefixes will appear in yellow, blue, green, red, and cyan respectively.*
 
 ## Safety Notes
 
@@ -104,4 +160,4 @@ Note: The links point to the exact commit where each file was found, allowing im
 
 ## License
 
-This tool is provided as-is for educational purposes.
+MIT
