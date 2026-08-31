@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+*.exe
+*.o
+*.a
+
+# Temporary files
+*.tmp
+
+# Dependencies (if we don't want to commit json.hpp)
+# json.hpp
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
