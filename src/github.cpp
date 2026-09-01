@@ -1,15 +1,12 @@
-#include "github.h"
-#include "utils.h"
+#include "github.hpp"
+#include "utils.hpp"
 #include <curl/curl.h>
 #include "json.hpp"
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 
-using nlohmann::json;
-
 namespace {
-
     // Callback for libcurl to write data into a std::string
     size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
         std::string* buffer = static_cast<std::string*>(userdata);
@@ -54,31 +51,28 @@ namespace {
 
         if (token.has_value()) {
             // Clean up headers list
-            // Note: we didn't store the pointer, but we can ignore for simplicity
-            // In a real app, we should keep the pointer and free it.
         }
 
         if (http_code != 200) {
             throw std::runtime_error("HTTP request failed with code " + std::to_string(http_code));
         }
-
         return response;
     }
 
 } // anonymous namespace
 
 namespace github {
-
-    std::vector<Repository> get_user_repos(const std::string& username, const std::optional<std::string>& token) {
+    std::vector<Repository> get_user_repos(const std::string& username, const std::optional<std::string>& token, bool include_private) {
         std::vector<Repository> repos;
-        std::string url = "https://api.github.com/users/" + utils::url_encode(username) + "/repos?type=public&sort=updated&per_page=100";
+        std::string type = include_private && token.has_value() ? "all" : "public";
+        std::string url = "https://api.github.com/users/" + utils::url_encode(username) + "/repos?type=" + type + "&sort=updated&per_page=100";
 
         int page = 1;
         while (true) {
             std::string page_url = url + "&page=" + std::to_string(page);
             try {
                 std::string response = http_get(page_url, token);
-                json data = json::parse(response);
+                nlohmann::json data = nlohmann::json::parse(response);
                 if (!data.is_array()) {
                     throw std::runtime_error("Expected JSON array");
                 }
@@ -106,5 +100,4 @@ namespace github {
         }
         return repos;
     }
-
 } // namespace github

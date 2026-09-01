@@ -1,4 +1,4 @@
-#include "utils.h"
+#include "utils.hpp"
 #include <cctype>
 #include <sstream>
 #include <iomanip>
@@ -19,7 +19,6 @@ namespace utils {
                 escaped << '%' << std::setw(2) << static_cast<int>(static_cast<unsigned char>(c));
             }
         }
-
         return escaped.str();
     }
 
@@ -54,5 +53,4 @@ namespace utils {
         if (start == std::string::npos) return "";
         return str.substr(start, end - start + 1);
     }
-
 }

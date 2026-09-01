@@ -1,5 +1,5 @@
-#include "scanner.h"
-#include "utils.h"
+#include "scanner.hpp"
+#include "utils.hpp"
 #include <cstdio>
 #include <array>
 #include <memory>
@@ -133,10 +133,8 @@ namespace scanner {
                     break;
                 }
             }
-            if (skip) {
-                continue;
-            }
-
+            if (skip) continue;
+            
             std::string basename = utils::split(file_path, '/').back();
 
             // Check if it matches our env pattern
@@ -162,8 +160,6 @@ namespace scanner {
                 file_to_commit[file_path] = current_hash;
             }
         }
-
         return file_to_commit;
     }
-
 } // namespace scanner

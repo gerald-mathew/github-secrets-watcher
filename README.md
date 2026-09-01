@@ -1,16 +1,18 @@
 # GitHub Secrets Watcher - C++ Version
 
-A command-line tool that scans public GitHub repositories for accidentally committed environment files (like `.env`, config files with secrets, etc.) in the Git history and reports findings (read-only, no modifications).
+A command-line tool that scans GitHub repositories (public and private with token) for accidentally committed environment files (like `.env`, config files with secrets, etc.) in the Git history and reports findings (read-only, no modifications).
 
 ## Features
 
-- Scans public repositories for a given GitHub username
-- Checks Git history for files matching environment/configuration patterns
+- Scans public and private repositories (with token) for a given GitHub username
+- Checks Git history for environment/configuration files across multiple branches (configurable depth)
 - Excludes common directories (like `node_modules`, `.git`, `dist`, etc.) to reduce noise
 - Provides direct links to the exact commit where each file appears (with URL-encoding for safety)
 - Validates commit hash format (40 hex characters) to prevent broken links
 - Read-only operations only - does not modify any repositories
-- Optional GitHub token for higher API rate limits
+- Optional GitHub token for higher API rate limits and access to private repositories
+- Multi-threaded repository scanning for improved performance (configurable thread count)
+- Configurable output formats: human-readable text, machine-readable JSON, or CSV
 - Colored terminal output for better readability (ANSI colors, Windows VT processing enabled)
 - Memory-efficient stream-based processing
 - Modern C++20 standard
@@ -97,17 +99,32 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 # Basic scan (no token needed for public repos)
 ./github_secrets_watcher scan --username YOUR_USERNAME
 
-# With token for higher API rate limits
+# With token for higher API rate limits and access to private repos
 ./github_secrets_watcher scan --username YOUR_USERNAME --token YOUR_PERSONAL_ACCESS_TOKEN
+
+# Scan private repositories (requires token)
+./github_secrets_watcher scan --username YOUR_USERNAME --token YOUR_PERSONAL_ACCESS_TOKEN --include-private
+
+# Specify number of threads for parallel scanning (default: hardware concurrency)
+./github_secrets_watcher scan --username YOUR_USERNAME --threads 4
+
+# Specify output format (text, json, csv)
+./github_secrets_watcher scan --username YOUR_USERNAME --format json --output results.json
 
 # Optional parameters
 --depth <NUM>      Commits to scan in history (default: 100)
 --max-repos <NUM>  Maximum repositories to scan (default: all)
+--include-private  Include private repositories (requires token)
+--threads <NUM>    Number of threads to use for scanning (default: hardware concurrency)
+--format <FMT>     Output format: text, json, or csv (default: text)
+--output <FILE>    Output file path (default: stdout)
 ```
 
 **Note:** If you are not in the build directory, adjust the path to the executable accordingly.
 
 ## Example Output
+
+### Text Format
 
 ``` text
 [WARN] WARNING: This tool scans public repository history for educational purposes.
@@ -150,6 +167,36 @@ Do you want to continue? (y/N): y
 ```
 
 *Note: In a terminal that supports ANSI colors, the [WARN], [INFO], [OK], [FAIL], and [LINK] prefixes will appear in yellow, blue, green, red, and cyan respectively.*
+
+### JSON Format Example
+
+```json
+[
+  {
+    "repo_name": "CareConnect-Clinic-Appointment-System",
+    "html_url": "https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System",
+    "success": true,
+    "files": [
+      {
+        "path": ".tmp-browser-check/playwright.config.js",
+        "commit_hash": "5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0"
+      },
+      {
+        "path": "client(First)/assets/js/config.js",
+        "commit_hash": "e537568aa7264bd1d27c6c5ba311e6440580873f"
+      }
+    ]
+  }
+]
+```
+
+### CSV Format Example
+
+```csv
+repo_name,success,error_message,file_path,commit_hash
+CareConnect-Clinic-Appointment-System,true,,"tmp-browser-check/playwright.config.js",5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0
+CareConnect-Clinic-Appointment-System,true,,"client(First)/assets/js/config.js",e537568aa7264bd1d27c6c5ba311e6440580873f
+```
 
 ## Safety Notes
 
