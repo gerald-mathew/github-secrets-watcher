@@ -98,31 +98,46 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 
 ```bash
 # Basic scan (no token needed for public repos)
-./github_secrets_watcher scan --username YOUR_USERNAME
+./github_secrets_watcher scan -u YOUR_USERNAME
 
 # With token for higher API rate limits and access to private repos
-./github_secrets_watcher scan --username YOUR_USERNAME --token YOUR_PERSONAL_ACCESS_TOKEN
+./github_secrets_watcher scan -u YOUR_USERNAME -t YOUR_PERSONAL_ACCESS_TOKEN
 
 # Scan private repositories (requires token)
-./github_secrets_watcher scan --username YOUR_USERNAME --token YOUR_PERSONAL_ACCESS_TOKEN --include-private
+./github_secrets_watcher scan -u YOUR_USERNAME -t YOUR_PERSONAL_ACCESS_TOKEN -p
 
 # Specify number of threads for parallel scanning (default: hardware concurrency)
-./github_secrets_watcher scan --username YOUR_USERNAME --threads 4
+./github_secrets_watcher scan -u YOUR_USERNAME -n 4
 
 # Specify output format (text, json, csv)
-./github_secrets_watcher scan --username YOUR_USERNAME --format json --output results.json
+./github_secrets_watcher scan -u YOUR_USERNAME -f json -o results.json
 
-# Enable verbose output (shows detailed progress for each repository)
-./github_secrets_watcher scan --username YOUR_USERNAME --verbose
+# Enable verbose output (shows detailed progress for each repository with timestamps)
+./github_secrets_watcher scan -u YOUR_USERNAME -v
 
-# Optional parameters
---depth <NUM>      Commits to scan in history (default: 100)
---max-repos <NUM>  Maximum repositories to scan (default: all)
---include-private  Include private repositories (requires token)
---threads <NUM>    Number of threads to use for scanning (default: hardware concurrency)
---format <FMT>     Output format: text, json, or csv (default: text)
---output <FILE>    Output file path (default: stdout)
---verbose          Show detailed progress for each repository during scanning
+# Optional parameters (long and short forms available)
+-d, --depth <NUM>      Commits to scan in history (default: 100)
+-m, --max-repos <NUM>  Maximum repositories to scan (default: all)
+-p, --include-private  Include private repositories (requires token)
+-n, --threads <NUM>    Number of threads to use for scanning (default: hardware concurrency)
+-f, --format <FMT>     Output format: text, json, or csv (default: text)
+-o, --output <FILE>    Output file path (default: stdout)
+-v, --verbose          Show detailed progress for each repository during scanning (includes timestamps)
+-u, --username <USERNAME>   GitHub username (required)
+-t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)
+```
+
+**Progress Indicator:**
+When running without `--verbose`, the tool shows a real-time progress indicator:
+```
+[14:30:22] Progress: 5/20 repositories (25%)
+```
+When using `--verbose`, detailed output with timestamps is shown for each repository:
+```
+[14:30:22] Scanning: repository-name
+[14:30:22] [INFO] Cloning repository (depth=100)...
+[14:30:23] [INFO] Scanning history...
+[14:30:25] [WARN] Found 3 potential environment/configuration files:
 ```
 
 **Note:** If you are not in the build directory, adjust the path to the executable accordingly.

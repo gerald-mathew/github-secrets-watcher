@@ -21,23 +21,19 @@
 
 namespace scanner {
 
+    // Constants for file scanning - defined at file scope to avoid recreation
+    static const std::set<std::string> EXCLUDED_DIRS = {
+        "node_modules", ".git", "__pycache__", "dist", "build", "coverage",
+        ".next", ".nuxt", "vendor", "bower_components", ".svelte-kit",
+        ".cache", ".parcel", ".webpack", ".turbo", ".expo", "android", "ios"
+    };
+
+    static const std::regex env_pattern(R"(\.(env|env\.)|config|settings|secrets)", std::regex::icase);
+    static const std::set<std::string> SAFE_EXTENSIONS = {".example", ".template", ".md", ".txt", ".gitignore", ".sample"};
+
     std::map<std::string, std::string> scan_repo_history(const std::string& repo_path, int depth) {
         (void)depth; // suppress unused warning - depth is used in the clone step by the caller
         std::map<std::string, std::string> file_to_commit; // file_path -> commit_hash
-
-        // Directories to exclude (to avoid scanning node_modules, etc.)
-        const std::set<std::string> EXCLUDED_DIRS = {
-            "node_modules", ".git", "__pycache__", "dist", "build", "coverage",
-            ".next", ".nuxt", "vendor", "bower_components", ".svelte-kit",
-            ".cache", ".parcel", ".webpack", ".turbo", ".expo", "android", "ios"
-        };
-
-        // Patterns that suggest environment/configuration files
-        std::regex env_pattern(R"(\.(env|env\.)|config|settings|secrets)", std::regex::icase);
-        // Extensions that are likely safe (templates, documentation, etc.)
-        const std::set<std::string> SAFE_EXTENSIONS = {".example", ".template", ".md", ".txt", ".gitignore", ".sample"};
-        // Hash validation regex (40 hex characters)
-        std::regex hash_re(R"([0-9a-f]{40})");
 
         git_repository* repo = nullptr;
         git_revwalk* walk = nullptr;
@@ -107,14 +103,9 @@ namespace scanner {
                 std::filesystem::path path_obj(file_path);
                 std::string normalized_path = path_obj.generic_string();
 
-                // Skip if any part of the path is in an excluded directory
+                // Directories to exclude (to avoid scanning node_modules, etc.)
                 bool skip = false;
                 for (const auto& part : path_obj) {
-                    const std::set<std::string> EXCLUDED_DIRS = {
-                        "node_modules", ".git", "__pycache__", "dist", "build", "coverage",
-                        ".next", ".nuxt", "vendor", "bower_components", ".svelte-kit",
-                        ".cache", ".parcel", ".webpack", ".turbo", ".expo", "android", "ios"
-                    };
                     if (EXCLUDED_DIRS.find(part.string()) != EXCLUDED_DIRS.end()) {
                         skip = true;
                         break;
@@ -125,7 +116,7 @@ namespace scanner {
                 std::string basename = path_obj.filename().string();
 
                 // Patterns that suggest environment/configuration files
-                std::regex env_pattern(R"(\.(env|env\.)|config|settings|secrets)", std::regex::icase);
+                const std::regex env_pattern(R"(\.(env|env\.)|config|settings|secrets)", std::regex::icase);
                 // Extensions that are likely safe (templates, documentation, etc.)
                 const std::set<std::string> SAFE_EXTENSIONS = {".example", ".template", ".md", ".txt", ".gitignore", ".sample"};
 
