@@ -4,7 +4,6 @@
 #include <vector>
 
 namespace utils {
-
     // URL encode a string (percent-encoding)
     std::string url_encode(const std::string& value);
 
@@ -19,5 +18,4 @@ namespace utils {
 
     // Trim whitespace from both ends
     std::string trim(const std::string& str);
-
 }

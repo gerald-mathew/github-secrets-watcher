@@ -14,6 +14,8 @@ SRC_DIR="../src"
 # Libcurl include and library paths for MSYS2 UCRT64
 LIBURL_INCLUDE="/c/msys64/ucrt64/include"
 LIBURL_LIBDIR="/c/msys64/ucrt64/lib"
+LIBGIT2_INCLUDE="/c/msys64/ucrt64/include"
+LIBGIT2_LIBDIR="/c/msys64/ucrt64/lib"
 
 # Check if libcurl library exists (import library for dynamic linking)
 if [ ! -f "$LIBURL_LIBDIR/libcurl.dll.a" ]; then
@@ -21,10 +23,16 @@ if [ ! -f "$LIBURL_LIBDIR/libcurl.dll.a" ]; then
     exit 1
 fi
 
+# Check if libgit2 library exists (import library for dynamic linking)
+if [ ! -f "$LIBGIT2_LIBDIR/libgit2.dll.a" ]; then
+    echo "Error: libgit2 library not found at $LIBGIT2_LIBDIR/libgit2.dll.a"
+    exit 1
+fi
+
 # Compile with C++20
-g++ -std=c++20 -Wall -Wextra -I"$SRC_DIR" -I"$LIBURL_INCLUDE" \
+g++ -std=c++20 -Wall -Wextra -I"$SRC_DIR" -I"$LIBURL_INCLUDE" -I"$LIBGIT2_INCLUDE" \
     "$SRC_DIR/main.cpp" "$SRC_DIR/github.cpp" "$SRC_DIR/scanner.cpp" "$SRC_DIR/utils.cpp" \
-    -L"$LIBURL_LIBDIR" -lcurl \
+    -L"$LIBURL_LIBDIR" -L"$LIBGIT2_LIBDIR" -lcurl -lgit2 \
     -o github_secrets_watcher
 
 if [ $? -eq 0 ]; then

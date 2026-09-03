@@ -1,0 +1,50 @@
+[1/7] Repository: github-secrets-watcher
+  Status: Success
+  No potential environment files found.
+
+[4/7] Repository: CareConnect-Clinic-Appointment-System
+  Status: Success
+  Found 7 potential environment/configuration files:
+    - .tmp-browser-check/playwright.config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7797f85bd2f83f828edea0b353a9f69991a2db4/.tmp-browser-check%2fplaywright.config.js
+    - client(First)/assets/js/config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/1008a4e37c20daa635b148a2094a9966263c6fd0/client%28First%29%2fassets%2fjs%2fconfig.js
+    - client/assets/js/config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/client%2fassets%2fjs%2fconfig.js
+    - client/eslint.config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/1008a4e37c20daa635b148a2094a9966263c6fd0/client%2feslint.config.js
+    - client/src/config
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/1008a4e37c20daa635b148a2094a9966263c6fd0/client%2fsrc%2fconfig
+    - client/vite.config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/1008a4e37c20daa635b148a2094a9966263c6fd0/client%2fvite.config.js
+    - server/src/config
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/server%2fsrc%2fconfig
+
+[5/7] Repository: StudySync
+  Status: Success
+  Found 2 potential environment/configuration files:
+    - client/assets/js/config.js
+      [LINK] https://github.com/Gerald-Mathew/StudySync/blob/94d3ab26b592cbfabf11d1ed23dda493595ad5a1/client%2fassets%2fjs%2fconfig.js
+    - server/src/config
+      [LINK] https://github.com/Gerald-Mathew/StudySync/blob/94d3ab26b592cbfabf11d1ed23dda493595ad5a1/server%2fsrc%2fconfig
+
+[3/7] Repository: FlightReservation-CLI
+  Status: Success
+  Found 1 potential environment/configuration files:
+    - /config
+      [LINK] https://github.com/Gerald-Mathew/FlightReservation-CLI/blob/bb727d2d60fa0238f748f7ccfb97273d39390781/%2fconfig
+
+[7/7] Repository: VirtualBank-CLI
+  Status: Success
+  No potential environment files found.
+
+[2/7] Repository: Portfolio
+  Status: Success
+  No potential environment files found.
+
+[6/7] Repository: FlightReservation-GUI
+  Status: Success
+  Found 1 potential environment/configuration files:
+    - /config
+      [LINK] https://github.com/Gerald-Mathew/FlightReservation-GUI/blob/79aec0c80c16a39ba20cf8fa3889ef42fb069e02/%2fconfig
+

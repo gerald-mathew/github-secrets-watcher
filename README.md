@@ -21,12 +21,13 @@ A command-line tool that scans GitHub repositories (public and private with toke
 
 - C++20 compiler (g++, clang++, or MSVC)
 - libcurl development library
+- libgit2 development library (version 1.9+)
 - nlohmann/json (single header included in the repository)
 
 ### On Ubuntu/Debian
 
 ```bash
-sudo apt-get install build-essential libcurl4-openssl-dev
+sudo apt-get install build-essential libcurl4-openssl-dev libgit2-dev
 ```
 
 *Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
@@ -35,7 +36,7 @@ sudo apt-get install build-essential libcurl4-openssl-dev
 
 ```bash
 sudo yum groupinstall "Development Tools"
-sudo yum install libcurl-devel
+sudo yum install libcurl-devel libgit2-devel
 ```
 
 *Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
@@ -43,7 +44,7 @@ sudo yum install libcurl-devel
 ### On macOS (using Homebrew)
 
 ```bash
-brew install curl
+brew install curl libgit2
 ```
 
 *Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
@@ -51,7 +52,7 @@ brew install curl
 ### On Windows (using MSYS2)
 
 ```bash
-pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-libcurl
+pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-libcurl mingw-w64-x86_64-libgit2
 ```
 
 *Note: nlohmann/json is provided as a single header (json.hpp) in the src/ directory.*
@@ -111,6 +112,9 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 # Specify output format (text, json, csv)
 ./github_secrets_watcher scan --username YOUR_USERNAME --format json --output results.json
 
+# Enable verbose output (shows detailed progress for each repository)
+./github_secrets_watcher scan --username YOUR_USERNAME --verbose
+
 # Optional parameters
 --depth <NUM>      Commits to scan in history (default: 100)
 --max-repos <NUM>  Maximum repositories to scan (default: all)
@@ -118,13 +122,52 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 --threads <NUM>    Number of threads to use for scanning (default: hardware concurrency)
 --format <FMT>     Output format: text, json, or csv (default: text)
 --output <FILE>    Output file path (default: stdout)
+--verbose          Show detailed progress for each repository during scanning
 ```
 
 **Note:** If you are not in the build directory, adjust the path to the executable accordingly.
 
 ## Example Output
 
-### Text Format
+### Text Format (Normal - without --verbose)
+
+``` text
+[WARN] WARNING: This tool scans public repository history for educational purposes.
+         Only scan repositories you own or have permission to scan.
+         This tool performs read-only operations and does not modify any repositories.
+
+Do you want to continue? (y/N): y
+[INFO] Scanning public repositories for user: Gerald-Mathew
+[INFO] History depth: 100 commits
+[INFO] Maximum repos to scan: 5
+
+[INFO] Found 7 public repositories to scan.
+
+[INFO] Scan complete!
+Repository: github-secrets-watcher
+  Status: Success
+  No potential environment files found.
+
+Repository: FlightReservation-CLI
+  Status: Success
+  No potential environment files found.
+
+Repository: CareConnect-Clinic-Appointment-System
+  Status: Success
+  Found 5 potential environment/configuration files:
+    - .tmp-browser-check/playwright.config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0/.tmp-browser-check%2fplaywright.config.js
+    - client(First)/assets/js/config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/e537568aa7264bd1d27c6c5ba311e6440580873f/client%28First%29%2fassets%2fjs%2fconfig.js
+    - client/assets/js/config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/client%2fassets%2fjs%2fconfig.js
+    - client/eslint.config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/client%2feslint.config.js
+    - client/vite.config.js
+      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/c7e0fba59fd2141970193909f4e58e2888fca267/client%2fvite.config.js
+```
+
+### Text Format (Verbose - with --verbose)
 
 ``` text
 [WARN] WARNING: This tool scans public repository history for educational purposes.

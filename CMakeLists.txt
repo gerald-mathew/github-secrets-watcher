@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find required packages
 find_package(CURL REQUIRED)
+find_package(Git2 REQUIRED)
 
 add_executable(github_secrets_watcher
     src/main.cpp
@@ -19,9 +20,11 @@ target_include_directories(github_secrets_watcher PRIVATE src)
 # Link libraries
 target_link_libraries(github_secrets_watcher PRIVATE
     ${CURL_LIBRARIES}
+    ${Git2_LIBRARIES}
 )
 
-# Include directories (if any from CURL)
+# Include directories (if any from CURL and Git2)
 target_include_directories(github_secrets_watcher PRIVATE
     ${CURL_INCLUDE_DIRS}
+    ${Git2_INCLUDE_DIRS}
 )
