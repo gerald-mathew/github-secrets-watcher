@@ -11,11 +11,13 @@
 #include <mutex>
 #include <fstream>
 #include <sstream>
+#include <atomic>
 
 #include "github.hpp"
 #include "scanner.hpp"
 #include "utils.hpp"
 #include "thread_pool.hpp"
+#include <git2.h>
 
 // Output format options
 enum class OutputFormat {
@@ -37,6 +39,7 @@ struct RepoResult {
     bool success;
     std::string error_message;
     std::vector<FoundFile> files;
+    size_t index; // For progress tracking in output
 };
 
 // Global variables for output configuration
@@ -68,6 +71,53 @@ const char* const COLOR_OK     = COLOR_GREEN;
 const char* const COLOR_FAIL   = COLOR_RED;
 const char* const COLOR_LINK   = COLOR_CYAN;
 
+// RAII wrapper for libgit2 initialization
+struct Git2Library {
+    Git2Library() {
+        int error = git_libgit2_init();
+        if (error < 0) {
+            const git_error* e = giterr_last();
+            throw std::runtime_error("Failed to initialize libgit2: " + std::string(e->message));
+        }
+        initialized_ = true;
+    }
+    ~Git2Library() {
+        if (initialized_) {
+            git_libgit2_shutdown();
+        }
+    }
+    bool initialized_ = false;
+};
+
+// Function to create a temporary directory for cloning
+std::string create_temp_dir(const std::string& repo_name) {
+    auto now = std::chrono::system_clock::now();
+    auto duration = now.time_since_epoch();
+    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    fs::path temp_base_path = std::getenv("TEMP") ? fs::path(std::getenv("TEMP")) : fs::path("/tmp");
+    fs::path temp_dir_path = temp_base_path / ("github_secrets_watcher_" + repo_name + "_" + std::to_string(millis));
+
+    // Create directory using filesystem
+    try {
+        fs::create_directories(temp_dir_path);
+    } catch (const fs::filesystem_error& e) {
+        throw std::runtime_error("Failed to create temporary directory: " + temp_dir_path.string() + " - " + e.what());
+    }
+    return temp_dir_path.string();
+}
+
+// Function to remove a directory and its contents
+void remove_dir(const std::string& dir_path) {
+    // Remove directory using filesystem
+    try {
+        fs::remove_all(dir_path);
+        // Ignore errors for cleanup as before
+    } catch (const fs::filesystem_error& e) {
+        // Ignore errors for cleanup as before
+        // Optionally log warning: std::cerr << "Warning: Failed to remove directory " << dir_path << ": " << e.what() << std::endl;
+    }
+}
+
 // Print usage information
 void print_usage(const std::string& prog_name) {
     std::cout << "Usage: " << prog_name << " scan --username <USERNAME> [--token <TOKEN>] [--depth <DEPTH>] [--max-repos <NUM>] [--include-private] [--threads <NUM>] [--format <FMT>] [--output <FILE>]\n\n";
@@ -83,51 +133,9 @@ void print_usage(const std::string& prog_name) {
 }
 
 // Function to process a single repository (cloning and scanning)
-void process_repository(const Repository& repo, int depth,
-                        const std::string& username,
-                        const std::optional<std::string>& token);
-
-// Helper functions for output
-void output_results();
-void print_usage(const std::string& prog_name);
-
-// Function to create a temporary directory for cloning
-std::string create_temp_dir(const std::string& repo_name) {
-    auto now = std::chrono::system_clock::now();
-    auto duration = now.time_since_epoch();
-    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-    std::string temp_base = std::getenv("TEMP") ? std::getenv("TEMP") : "/tmp";
-    std::string temp_dir = temp_base + "/github_secrets_watcher_" + repo_name + "_" + std::to_string(millis);
-
-    // Create directory
-    #ifdef _WIN32
-        std::string mkdir_cmd = "mkdir \"" + temp_dir + "\"";
-    #else
-        std::string mkdir_cmd = "mkdir -p \"" + temp_dir + "\"";
-    #endif
-    int result = std::system(mkdir_cmd.c_str());
-    if (result != 0) {
-        throw std::runtime_error("Failed to create temporary directory: " + temp_dir);
-    }
-    return temp_dir;
-}
-
-// Function to remove a directory and its contents
-void remove_dir(const std::string& dir_path) {
-    #ifdef _WIN32
-        std::string rm_cmd = "rmdir /s /q \"" + dir_path + "\"";
-    #else
-        std::string rm_cmd = "rm -rf \"" + dir_path + "\"";
-    #endif
-    std::system(rm_cmd.c_str()); // Ignore errors for cleanup
-}
-
-// Function to process a single repository (cloning and scanning)
-void process_repository(const Repository& repo, int depth,
-                        const std::string& username,
-                        const std::optional<std::string>& token) {
+void process_repository(const Repository& repo, int depth, const std::string& username, const std::optional<std::string>& token, size_t index, bool verbose) {
     // Output status message to console (with mutex)
-    {
+    if (verbose) {
         std::lock_guard<std::mutex> lock(g_console_mutex);
         std::cerr << "Scanning: " << repo.name << std::endl;
     }
@@ -149,37 +157,75 @@ void process_repository(const Repository& repo, int depth,
             // No token, use public URL
             clone_url = "https://github.com/" + username + "/" + repo.name + ".git";
         }
-        {
+        if (verbose) {
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "Cloning repository (depth=" << depth << ")..." << std::endl;
         }
 
-        #ifdef _WIN32
-            std::string clone_cmd = "cd \"" + temp_dir + "\" && git clone --quiet --depth " + std::to_string(depth) + " \"" + clone_url + "\" .";
-        #else
-            std::string clone_cmd = "cd \"" + temp_dir + "\" && git clone --quiet --depth " + std::to_string(depth) + " " + clone_url + " .";
-        #endif
-        int clone_result = std::system(clone_cmd.c_str());
-        if (clone_result != 0) {
-            throw std::runtime_error("Git clone failed with exit code " + std::to_string(clone_result));
+        // Clone repository using libgit2
+        git_clone_options clone_opts = GIT_CLONE_OPTIONS_INIT;
+        clone_opts.checkout_branch = nullptr; // Use default branch
+
+        // Set depth if specified (shallow clone)
+        if (depth > 0) {
+            clone_opts.fetch_opts.depth = depth;
+            // localclone is not a member in this version, using default behavior
+        }
+
+        // Set up credentials if token is provided
+        git_cred* cred = nullptr;
+        if (token.has_value()) {
+            git_cred_userpass_plaintext_new(&cred, token.value().c_str(), "x-oauth-basic");
+            clone_opts.fetch_opts.callbacks.credentials = [](git_cred** out, const char* url, const char* username_from_url, unsigned int allowed_types, void* payload) -> int {
+                (void)url;
+                (void)username_from_url;
+                (void)allowed_types;
+                git_cred* cred = *static_cast<git_cred**>(payload);
+                *out = cred;
+                return 0;
+            };
+            clone_opts.fetch_opts.callbacks.payload = &cred;
+        }
+
+        // Perform the clone
+        git_repository* cloned_repo = nullptr;
+        int error = git_clone(&cloned_repo, clone_url.c_str(), temp_dir.c_str(), &clone_opts);
+
+        // Cleanup credentials
+        if (cred) {
+            git_cred_free(cred);
+        }
+
+        if (error < 0) {
+            const git_error* e = giterr_last();
+            if (verbose) {
+                std::lock_guard<std::mutex> lock(g_console_mutex);
+                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "Git clone failed: " << std::string(e->message) << std::endl;
+            }
+            throw std::runtime_error("Git clone failed: " + std::string(e->message));
+        }
+
+        // Cleanup cloned repository handle (we don't need to keep it open)
+        if (cloned_repo) {
+            git_repository_free(cloned_repo);
         }
 
         // Scan history for env-like files
-        {
+        if (verbose) {
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning history..." << std::endl;
         }
         std::map<std::string, std::string> file_to_commit = scanner::scan_repo_history(temp_dir, depth);
 
         if (!file_to_commit.empty()) {
-            {
+            if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
                 std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "Found " << file_to_commit.size() << " potential environment/configuration files:" << std::endl;
             }
             for (const auto& [file_path, commit_hash] : file_to_commit) {
                 // Validate commit hash format (40 hex characters)
                 if (!utils::is_valid_commit_hash(commit_hash)) {
-                    {
+                    if (verbose) {
                         std::lock_guard<std::mutex> lock(g_console_mutex);
                         std::cerr << "     - " << file_path << std::endl;
                         std::cerr << "       " << COLOR_WARN << "[WARN] " << COLOR_RESET << "Invalid commit hash: " << commit_hash << std::endl;
@@ -192,7 +238,7 @@ void process_repository(const Repository& repo, int depth,
                 std::string encoded_file_path = utils::url_encode(file_path);
                 std::string file_url = repo_url + "/blob/" + commit_hash + "/" + encoded_file_path;
 
-                {
+                if (verbose) {
                     std::lock_guard<std::mutex> lock(g_console_mutex);
                     std::cerr << "     - " << file_path << std::endl;
                     std::cerr << "       " << COLOR_LINK << "[LINK] " << COLOR_RESET << file_url << std::endl;
@@ -202,7 +248,7 @@ void process_repository(const Repository& repo, int depth,
                 files.push_back({file_path, commit_hash});
             }
         } else {
-            {
+            if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
                 std::cerr << COLOR_OK << "[OK] " << COLOR_RESET << "No potential environment files found in history." << std::endl;
             }
@@ -211,14 +257,14 @@ void process_repository(const Repository& repo, int depth,
     } catch (const std::exception& e) {
         success = false;
         error_message = e.what();
-        {
+        if (verbose) {
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "Error processing " << repo.name << ": " << e.what() << std::endl;
         }
     } catch (...) {
         success = false;
         error_message = "Unknown error";
-        {
+        if (verbose) {
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "Unknown error processing " << repo.name << std::endl;
         }
@@ -230,12 +276,12 @@ void process_repository(const Repository& repo, int depth,
     // Add the result to the global results
     {
         std::lock_guard<std::mutex> lock(g_results_mutex);
-        g_results.push_back({repo.name, repo.html_url, success, error_message, files});
+        g_results.push_back({repo.name, repo.html_url, success, error_message, files, index});
     }
 }
 
 // Helper function to output the results in the chosen format
-void output_results() {
+void output_results(bool verbose) {
     std::lock_guard<std::mutex> lock(g_output_mutex);
     switch (g_output_format) {
         case OutputFormat::JSON: {
@@ -295,7 +341,11 @@ void output_results() {
         }
         case OutputFormat::Text: {
             for (const auto& r : g_results) {
-                *g_output_stream << "Repository: " << r.repo_name << "\n";
+                if (verbose) {
+                    *g_output_stream << "[" << (r.index + 1) << "/" << g_results.size() << "] Repository: " << r.repo_name << "\n";
+                } else {
+                    *g_output_stream << "Repository: " << r.repo_name << "\n";
+                }
                 if (r.success) {
                     *g_output_stream << "  Status: Success\n";
                 } else {
@@ -340,6 +390,9 @@ int main(int argc, char* argv[]) {
     enable_vt_processing();
     #endif
 
+    // Initialize libgit2
+    Git2Library git2lib;
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
@@ -358,6 +411,7 @@ int main(int argc, char* argv[]) {
     int depth = 100;
     std::optional<int> max_repos = std::nullopt;
     bool include_private = false;
+    bool verbose = false;
     int thread_count = static_cast<int>(std::thread::hardware_concurrency());
     if (thread_count <= 0) thread_count = 4; // fallback
     OutputFormat format = OutputFormat::Text;
@@ -448,6 +502,8 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             output_file = argv[++i];
+        } else if (arg == "--verbose") {
+            verbose = true;
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
             print_usage(argv[0]);
@@ -520,8 +576,10 @@ int main(int argc, char* argv[]) {
         {
             ThreadPool pool(thread_count);
 
+            size_t index = 0;
             for (const auto& repo : repos) {
-                pool.enqueue(process_repository, repo, depth, username, token);
+                pool.enqueue(process_repository, repo, depth, username, token, index, verbose);
+                index++;
             }
             // pool goes out of scope here, waiting for all threads
         }
@@ -529,7 +587,7 @@ int main(int argc, char* argv[]) {
         std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scan complete!\n";
 
         // Output results
-        output_results();
+        output_results(verbose);
 
         // Clean up if we opened an output file
         if (!output_file.empty()) {
