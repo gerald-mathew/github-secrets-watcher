@@ -19,6 +19,22 @@
 #include "thread_pool.hpp"
 #include <git2.h>
 
+// Helper function to get current timestamp for logging
+std::string get_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &time_t); // Windows
+#else
+    localtime_r(&time_t, &tm); // Linux/macOS
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%H:%M:%S");
+    return oss.str();
+}
+
 // Output format options
 enum class OutputFormat {
     Text,
@@ -51,6 +67,11 @@ std::mutex g_results_mutex;
 
 // Mutex for console output (status messages, errors, etc.)
 std::mutex g_console_mutex;
+
+// Progress tracking
+std::atomic<size_t> g_completed_count{0};
+std::mutex g_progress_mutex; // For protecting progress output to avoid interleaving
+size_t g_total_repos = 0;
 
 namespace fs = std::filesystem;
 
@@ -120,16 +141,17 @@ void remove_dir(const std::string& dir_path) {
 
 // Print usage information
 void print_usage(const std::string& prog_name) {
-    std::cout << "Usage: " << prog_name << " scan --username <USERNAME> [--token <TOKEN>] [--depth <DEPTH>] [--max-repos <NUM>] [--include-private] [--threads <NUM>] [--format <FMT>] [--output <FILE>]\n\n";
+    std::cout << "Usage: " << prog_name << " scan -u <USERNAME> [-t <TOKEN>] [-d <DEPTH>] [-m <NUM>] [-p] [-n <NUM>] [-f <FMT>] [-o <FILE>] [-v]\n\n";
     std::cout << "Options:\n";
-    std::cout << "  --username <USERNAME>   GitHub username (required)\n";
-    std::cout << "  --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)\n";
-    std::cout << "  --depth <NUM>           Commits to scan in history (default: 100)\n";
-    std::cout << "  --max-repos <NUM>       Maximum repositories to scan (default: all)\n";
-    std::cout << "  --include-private       Include private repositories (requires token)\n";
-    std::cout << "  --threads <NUM>         Number of threads to use for scanning (default: hardware concurrency)\n";
-    std::cout << "  --format <FMT>          Output format: text, json, or csv (default: text)\n";
-    std::cout << "  --output <FILE>         Output file path (default: stdout)\n";
+    std::cout << "  -u, --username <USERNAME>   GitHub username (required)\n";
+    std::cout << "  -t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)\n";
+    std::cout << "  -d, --depth <NUM>           Commits to scan in history (default: 100)\n";
+    std::cout << "  -m, --max-repos <NUM>       Maximum repositories to scan (default: all)\n";
+    std::cout << "  -p, --include-private       Include private repositories (requires token)\n";
+    std::cout << "  -n, --threads <NUM>         Number of threads to use for scanning (default: hardware concurrency)\n";
+    std::cout << "  -f, --format <FMT>          Output format: text, json, or csv (default: text)\n";
+    std::cout << "  -o, --output <FILE>         Output file path (default: stdout)\n";
+    std::cout << "  -v, --verbose               Enable verbose output\n";
 }
 
 // Function to process a single repository (cloning and scanning)
@@ -137,7 +159,16 @@ void process_repository(const Repository& repo, int depth, const std::string& us
     // Output status message to console (with mutex)
     if (verbose) {
         std::lock_guard<std::mutex> lock(g_console_mutex);
-        std::cerr << "Scanning: " << repo.name << std::endl;
+        std::cerr << "[" << get_timestamp() << "] Scanning: " << repo.name << std::endl;
+    } else {
+        // Show progress indicator for non-verbose mode
+        {
+            std::lock_guard<std::mutex> lock(g_progress_mutex);
+            size_t completed = ++g_completed_count;
+            std::cerr << "\r[" << get_timestamp() << "] Progress: " << completed << "/" << g_total_repos
+                      << " repositories (" << static_cast<int>((completed * 100.0) / g_total_repos) << "%)   ";
+            std::cerr.flush();
+        }
     }
 
     // Create a temporary directory for cloning (read-only)
@@ -200,7 +231,7 @@ void process_repository(const Repository& repo, int depth, const std::string& us
             const git_error* e = giterr_last();
             if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
-                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "Git clone failed: " << std::string(e->message) << std::endl;
+                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "[" << get_timestamp() << "] Git clone failed: " << std::string(e->message) << std::endl;
             }
             throw std::runtime_error("Git clone failed: " + std::string(e->message));
         }
@@ -213,14 +244,14 @@ void process_repository(const Repository& repo, int depth, const std::string& us
         // Scan history for env-like files
         if (verbose) {
             std::lock_guard<std::mutex> lock(g_console_mutex);
-            std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning history..." << std::endl;
+            std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "[" << get_timestamp() << "] Scanning history..." << std::endl;
         }
         std::map<std::string, std::string> file_to_commit = scanner::scan_repo_history(temp_dir, depth);
 
         if (!file_to_commit.empty()) {
             if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
-                std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "Found " << file_to_commit.size() << " potential environment/configuration files:" << std::endl;
+                std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "[" << get_timestamp() << "] Found " << file_to_commit.size() << " potential environment/configuration files:" << std::endl;
             }
             for (const auto& [file_path, commit_hash] : file_to_commit) {
                 // Validate commit hash format (40 hex characters)
@@ -228,7 +259,7 @@ void process_repository(const Repository& repo, int depth, const std::string& us
                     if (verbose) {
                         std::lock_guard<std::mutex> lock(g_console_mutex);
                         std::cerr << "     - " << file_path << std::endl;
-                        std::cerr << "       " << COLOR_WARN << "[WARN] " << COLOR_RESET << "Invalid commit hash: " << commit_hash << std::endl;
+                        std::cerr << "       " << COLOR_WARN << "[WARN] " << COLOR_RESET << "[" << get_timestamp() << "] Invalid commit hash: " << commit_hash << std::endl;
                     }
                     continue;
                 }
@@ -419,19 +450,19 @@ int main(int argc, char* argv[]) {
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--username") {
+        if (arg == "--username" || arg == "-u") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --username requires a value\n";
                 return 1;
             }
             username = argv[++i];
-        } else if (arg == "--token") {
+        } else if (arg == "--token" || arg == "-t") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --token requires a value\n";
                 return 1;
             }
             token = argv[++i];
-        } else if (arg == "--depth") {
+        } else if (arg == "--depth" || arg == "-d") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --depth requires a value\n";
                 return 1;
@@ -446,7 +477,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --depth must be a number\n";
                 return 1;
             }
-        } else if (arg == "--max-repos") {
+        } else if (arg == "--max-repos" || arg == "-m") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --max-repos requires a value\n";
                 return 1;
@@ -462,9 +493,9 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --max-repos must be a number\n";
                 return 1;
             }
-        } else if (arg == "--include-private") {
+        } else if (arg == "--include-private" || arg == "-p") {
             include_private = true;
-        } else if (arg == "--threads") {
+        } else if (arg == "--threads" || arg == "-n") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --threads requires a value\n";
                 return 1;
@@ -480,7 +511,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --threads must be a number\n";
                 return 1;
             }
-        } else if (arg == "--format") {
+        } else if (arg == "--format" || arg == "-f") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --format requires a value\n";
                 return 1;
@@ -496,13 +527,13 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --format must be text, json, or csv\n";
                 return 1;
             }
-        } else if (arg == "--output") {
+        } else if (arg == "--output" || arg == "-o") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --output requires a value\n";
                 return 1;
             }
             output_file = argv[++i];
-        } else if (arg == "--verbose") {
+        } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
@@ -574,6 +605,10 @@ int main(int argc, char* argv[]) {
 
         // Process each repository using thread pool
         {
+            // Reset progress tracking
+            g_completed_count = 0;
+            g_total_repos = repos.size();
+
             ThreadPool pool(thread_count);
 
             size_t index = 0;
@@ -582,6 +617,11 @@ int main(int argc, char* argv[]) {
                 index++;
             }
             // pool goes out of scope here, waiting for all threads
+        }
+
+        // After all threads are done, move to next line for progress indicator
+        if (!verbose) {
+            std::cerr << std::endl;
         }
 
         std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scan complete!\n";
