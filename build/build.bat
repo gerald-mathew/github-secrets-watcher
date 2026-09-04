@@ -1,43 +1,89 @@
 @echo off
-REM Build script for github-secrets-watcher C++ version
-REM To be run from the build directory: .\build.bat
-REM Assumes source files are in the parent directory (src)
+setlocal EnableExtensions EnableDelayedExpansion
 
 echo Building github-secrets-watcher...
-
-REM Change to the directory where this script is located (build)
 cd /d "%~dp0"
-
-REM Define source directory (parent of build, then src)
 set "SRC_DIR=..\src"
 
-REM Define library paths for MSYS2 UCRT64
-set "LIBURL_LIBDIR=C:/msys64/ucrt64/lib"
-set "LIBGIT2_LIBDIR=C:/msys64/ucrt64/lib"
-set "LIBURL_INCLUDE=C:/msys64/ucrt64/include"
-set "LIBGIT2_INCLUDE=C:/msys64/ucrt64/include"
+set "SEARCH_DIRS="C:\msys64\mingw64" "C:\msys64\usr\local" "C:\" "C:\msys64" "C:\msys64\ucrt64" "C:\msys64\mingw64" "C:\Program Files" "C:\Program Files (x86)" "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC" "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC""
 
-REM Check if libcurl library exists
-if not exist "%LIBURL_LIBDIR%/libcurl.dll.a" (
-    echo Error: libcurl library not found at %LIBURL_LIBDIR%/libcurl.dll.a
+set "CURL_DIR="
+set "CURL_NAME="
+for %%D in (%SEARCH_DIRS%) do (
+    for %%N in (libcurl.dll.a libcurl.lib) do (
+        if not defined CURL_DIR if exist "%%~D\lib\%%N" (
+            set "CURL_DIR=%%~D\lib"
+            set "CURL_NAME=%%N"
+        )
+        if not defined CURL_DIR if exist "%%~D\%%N" (
+            set "CURL_DIR=%%~D"
+            set "CURL_NAME=%%N"
+        )
+    )
+)
+
+set "GIT2_DIR="
+set "GIT2_NAME="
+for %%D in (%SEARCH_DIRS%) do (
+    for %%N in (libgit2.dll.a libgit2.lib) do (
+        if not defined GIT2_DIR if exist "%%~D\lib\%%N" (
+            set "GIT2_DIR=%%~D\lib"
+            set "GIT2_NAME=%%N"
+        )
+        if not defined GIT2_DIR if exist "%%~D\%%N" (
+            set "GIT2_DIR=%%~D"
+            set "GIT2_NAME=%%N"
+        )
+    )
+)
+
+if not defined CURL_DIR (
+    echo Error: libcurl library not found
+    exit /b 1
+)
+if not defined GIT2_DIR (
+    echo Error: libgit2 library not found
     exit /b 1
 )
 
-REM Check if libgit2 library exists
-if not exist "%LIBGIT2_LIBDIR%/libgit2.dll.a" (
-    echo Error: libgit2 library not found at %LIBGIT2_LIBDIR%/libgit2.dll.a
+set "CURL_PREFIX=!CURL_DIR!"
+if "!CURL_PREFIX:~-4!"=="\lib" set "CURL_PREFIX=!CURL_PREFIX:~0,-4!"
+set "LIBURL_LIBDIR=!CURL_PREFIX!\lib"
+set "LIBURL_INCLUDE=!CURL_PREFIX!\include"
+
+set "GIT2_PREFIX=!GIT2_DIR!"
+if "!GIT2_PREFIX:~-4!"=="\lib" set "GIT2_PREFIX=!GIT2_PREFIX:~0,-4!"
+set "LIBGIT2_LIBDIR=!GIT2_PREFIX!\lib"
+set "LIBGIT2_INCLUDE=!GIT2_PREFIX!\include"
+
+if "!CURL_NAME:~-6!"==".dll.a" (set "CURL_LINK_FLAG=-lcurl") else (set "CURL_LINK_FLAG=libcurl.lib")
+if "!GIT2_NAME:~-6!"==".dll.a" (set "GIT2_LINK_FLAG=-lgit2") else (set "GIT2_LINK_FLAG=libgit2.lib")
+set "LINKER_LIBS=!CURL_LINK_FLAG! !GIT2_LINK_FLAG!"
+
+set "compiler="
+for %%C in (g++ clang++ cl) do (
+    if not defined compiler (
+        where %%C >nul 2>&1
+        if not errorlevel 1 set "compiler=%%C"
+    )
+)
+if not defined compiler (
+    echo Error: No suitable compiler found ^(g++, clang++, or cl^)
     exit /b 1
 )
+echo Using compiler: !compiler!
 
-REM Compile with C++20
-g++ -std=c++20 -Wall -Wextra -I"%SRC_DIR%" -I"%LIBURL_INCLUDE%" -I"%LIBGIT2_INCLUDE%" ^
-    "%SRC_DIR%\main.cpp" "%SRC_DIR%\github.cpp" "%SRC_DIR%\scanner.cpp" "%SRC_DIR%\utils.cpp" ^
-    -L"%LIBURL_LIBDIR%" -L"%LIBGIT2_LIBDIR%" -lcurl -lgit2 ^
-    -o github_secrets_watcher
+if "!compiler!"=="cl" (
+    set "COMPILE_CMD=!compiler! /std:c++20 /W3 /I"!LIBURL_INCLUDE!" /I"!LIBGIT2_INCLUDE!" /I"!SRC_DIR!" /LIBPATH:"!LIBURL_LIBDIR!" /LIBPATH:"!LIBGIT2_LIBDIR!" !SRC_DIR!\main.cpp !SRC_DIR!\github.cpp !SRC_DIR!\scanner.cpp !SRC_DIR!\utils.cpp !LINKER_LIBS! /Fe:github_secrets_watcher.exe"
+) else (
+    set "COMPILE_CMD=!compiler! -std=c++20 -Wall -Wextra -I"!SRC_DIR!" -I"!LIBURL_INCLUDE!" -I"!LIBGIT2_INCLUDE!" -L"!LIBURL_LIBDIR!" -L"!LIBGIT2_LIBDIR!" !SRC_DIR!/main.cpp !SRC_DIR!/github.cpp !SRC_DIR!/scanner.cpp !SRC_DIR!/utils.cpp !LINKER_LIBS! -o github_secrets_watcher"
+)
 
+!COMPILE_CMD!
 if errorlevel 1 (
     echo Build failed.
     exit /b 1
-) else (
-    echo Build successful! Executable: github_secrets_watcher
 )
+setlocal DisableDelayedExpansion
+echo Build successful! Executable: github_secrets_watcher
+exit /b 0
