@@ -5,12 +5,25 @@ echo Building github-secrets-watcher...
 cd /d "%~dp0"
 set "SRC_DIR=..\src"
 
-set "SEARCH_DIRS="C:\msys64\mingw64" "C:\msys64\usr\local" "C:\" "C:\msys64" "C:\msys64\ucrt64" "C:\msys64\mingw64" "C:\Program Files" "C:\Program Files (x86)" "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC" "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC""
+REM Enhanced search directories for libraries
+set "SEARCH_DIRS=C:\msys64\mingw64 C:\msys64\usr\local C:\ C:\msys64 C:\msys64\ucrt64 C:\msys64\mingw64 C:\Program Files C:\Program Files (x86) C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC C:\DevKit\mingw64 C:\DevKit\mingw32 C:\tools\msys64 C:\tools\msys64\mingw64 C:\tools\msys64\mingw32 C:\libs C:\dev-libs"
+
+REM Add environment variable paths if they exist
+if defined LIB (
+    for %%P in (%LIB%) do (
+        if exist "%%P" (
+            for %%D in ("%%P") do (
+                if not "%%~fD"=="%%P" set "SEARCH_DIRS=!SEARCH_DIRS! %%~fD"
+            )
+        )
+    )
+)
 
 set "CURL_DIR="
 set "CURL_NAME="
+REM Enhanced library names for curl
 for %%D in (%SEARCH_DIRS%) do (
-    for %%N in (libcurl.dll.a libcurl.lib) do (
+    for %%N in (libcurl.dll.a libcurl.lib libcurl_imp.lib) do (
         if not defined CURL_DIR if exist "%%~D\lib\%%N" (
             set "CURL_DIR=%%~D\lib"
             set "CURL_NAME=%%N"
@@ -24,6 +37,7 @@ for %%D in (%SEARCH_DIRS%) do (
 
 set "GIT2_DIR="
 set "GIT2_NAME="
+REM Enhanced library names for git2
 for %%D in (%SEARCH_DIRS%) do (
     for %%N in (libgit2.dll.a libgit2.lib) do (
         if not defined GIT2_DIR if exist "%%~D\lib\%%N" (

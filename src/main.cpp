@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <atomic>
+#include <algorithm>
 
 #include "github.hpp"
 #include "scanner.hpp"
@@ -141,7 +142,7 @@ void remove_dir(const std::string& dir_path) {
 
 // Print usage information
 void print_usage(const std::string& prog_name) {
-    std::cout << "Usage: " << prog_name << " scan -u <USERNAME> [-t <TOKEN>] [-d <DEPTH>] [-m <NUM>] [-p] [-n <NUM>] [-f <FMT>] [-o <FILE>] [-v]\n\n";
+    std::cout << "Usage: " << prog_name << " scan -u <USERNAME> [-t <TOKEN>] [-d <DEPTH>] [-m <NUM>] [-p] [-n <NUM>] [-f <FMT>] [-o <FILE>] [-v] [-r <REPO>] [-R <REPO1,REPO2,...>]\n\n";
     std::cout << "Options:\n";
     std::cout << "  -u, --username <USERNAME>   GitHub username (required)\n";
     std::cout << "  -t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)\n";
@@ -152,6 +153,9 @@ void print_usage(const std::string& prog_name) {
     std::cout << "  -f, --format <FMT>          Output format: text, json, or csv (default: text)\n";
     std::cout << "  -o, --output <FILE>         Output file path (default: stdout)\n";
     std::cout << "  -v, --verbose               Enable verbose output\n";
+    std::cout << "  -r, --repo <REPO>           Scan only the specified repository\n";
+    std::cout << "  -R, --repos <REPO1,REPO2,...>\n";
+    std::cout << "                              Scan only the specified repositories (comma-separated list)\n";
 }
 
 // Function to process a single repository (cloning and scanning)
@@ -447,6 +451,9 @@ int main(int argc, char* argv[]) {
     if (thread_count <= 0) thread_count = 4; // fallback
     OutputFormat format = OutputFormat::Text;
     std::string output_file;
+    // Repo selection options
+    std::optional<std::string> selected_repo;
+    std::optional<std::vector<std::string>> selected_repos_list;
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -535,6 +542,34 @@ int main(int argc, char* argv[]) {
             output_file = argv[++i];
         } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
+        } else if (arg == "--repo" || arg == "-r") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --repo requires a value\n";
+                return 1;
+            }
+            selected_repo = argv[++i];
+        } else if (arg == "--repos" || arg == "-R") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --repos requires a value\n";
+                return 1;
+            }
+            std::string repos_str = argv[++i];
+            std::vector<std::string> repos_list;
+            std::stringstream ss(repos_str);
+            std::string repo;
+            while (std::getline(ss, repo, ',')) {
+                // Trim whitespace
+                repo.erase(0, repo.find_first_not_of(" \t\n\r\f\v"));
+                repo.erase(repo.find_last_not_of(" \t\n\r\f\v") + 1);
+                if (!repo.empty()) {
+                    repos_list.push_back(repo);
+                }
+            }
+            if (repos_list.empty()) {
+                std::cerr << "Error: --repos must contain at least one repository name\n";
+                return 1;
+            }
+            selected_repos_list = repos_list;
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
             print_usage(argv[0]);
@@ -601,18 +636,60 @@ int main(int argc, char* argv[]) {
         }
 
         std::string repo_type = include_private ? "public and private" : "public";
-        std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Found " << repos.size() << " " << repo_type << " repositories to scan.\n\n";
+        std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Found " << repos.size() << " " << repo_type << " repositories.\n\n";
+
+        // Filter repositories based on --repo or --repos options
+        std::vector<Repository> filtered_repos;
+        if (selected_repo.has_value()) {
+            // Scan only the specified repository
+            auto it = std::find_if(repos.begin(), repos.end(), [&](const Repository& r) {
+                return r.name == selected_repo.value();
+            });
+            if (it != repos.end()) {
+                filtered_repos.push_back(*it);
+                std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning specified repository: " << selected_repo.value() << "\n\n";
+            } else {
+                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "Repository not found: " << selected_repo.value() << "\n";
+                return 0;
+            }
+        } else if (selected_repos_list.has_value()) {
+            // Scan only the specified repositories
+            for (const auto& repo_name : selected_repos_list.value()) {
+                auto it = std::find_if(repos.begin(), repos.end(), [&](const Repository& r) {
+                    return r.name == repo_name;
+                });
+                if (it != repos.end()) {
+                    filtered_repos.push_back(*it);
+                } else {
+                    std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "Repository not found (skipping): " << repo_name << "\n";
+                }
+            }
+            if (filtered_repos.empty()) {
+                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "No valid repositories found from the specified list.\n";
+                return 0;
+            }
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning " << filtered_repos.size() << " specified repositories.\n\n";
+        } else {
+            // No specific repos selected, use all repos (after max_repos filtering)
+            filtered_repos = repos;
+        }
+
+        // Apply max_repos limit if specified (in case it wasn't applied earlier)
+        if (max_repos.has_value() && static_cast<int>(filtered_repos.size()) > max_repos.value()) {
+            filtered_repos.resize(max_repos.value());
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Limited to " << max_repos.value() << " repositories.\n\n";
+        }
 
         // Process each repository using thread pool
         {
             // Reset progress tracking
             g_completed_count = 0;
-            g_total_repos = repos.size();
+            g_total_repos = filtered_repos.size();
 
             ThreadPool pool(thread_count);
 
             size_t index = 0;
-            for (const auto& repo : repos) {
+            for (const auto& repo : filtered_repos) {
                 pool.enqueue(process_repository, repo, depth, username, token, index, verbose);
                 index++;
             }

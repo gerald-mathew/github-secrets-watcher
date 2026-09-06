@@ -115,6 +115,14 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 # Enable verbose output (shows detailed progress for each repository with timestamps)
 ./github_secrets_watcher scan -u YOUR_USERNAME -v
 
+# Scan only a specific repository
+./github_secrets_watcher scan -u YOUR_USERNAME --repo REPO_NAME
+./github_secrets_watcher scan -u YOUR_USERNAME -r REPO_NAME
+
+# Scan only specific repositories (comma-separated list)
+./github_secrets_watcher scan -u YOUR_USERNAME --repos "repo1,repo2,repo3"
+./github_secrets_watcher scan -u YOUR_USERNAME -R "repo1,repo2,repo3"
+
 # Optional parameters (long and short forms available)
 -d, --depth <NUM>      Commits to scan in history (default: 100)
 -m, --max-repos <NUM>  Maximum repositories to scan (default: all)
@@ -125,6 +133,8 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 -v, --verbose          Show detailed progress for each repository during scanning (includes timestamps)
 -u, --username <USERNAME>   GitHub username (required)
 -t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)
+-r, --repo <REPO>           Scan only the specified repository
+-R, --repos <REPO1,REPO2,...>  Scan only the specified repositories (comma-separated list)
 ```
 
 **Progress Indicator:**

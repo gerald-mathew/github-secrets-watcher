@@ -28,9 +28,16 @@ if [ -d "/c" ] || [ -n "$MSYSTEM" ]; then
         "/c/Program Files (x86)"
         "/c/Program Files (x86)/Microsoft Visual Studio/2019/Community/VC/Tools/MSVC"
         "/c/Program Files (x86)/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC"
+        "/c/DevKit/mingw64"
+        "/c/DevKit/mingw32"
+        "/c/tools/msys64"
+        "/c/tools/msys64/mingw64"
+        "/c/tools/msys64/mingw32"
+        "/c/libs"
+        "/c/dev-libs"
     )
     # Library names for Windows
-    CURL_NAMES=("libcurl.dll.a" "libcurl.lib")
+    CURL_NAMES=("libcurl.dll.a" "libcurl.lib" "libcurl_imp.lib")
     GIT2_NAMES=("libgit2.dll.a" "libgit2.lib")
 else
     # We are in a Unix-like environment (Termux, Linux, etc.)
@@ -44,10 +51,66 @@ else
         "/usr/lib/i386-linux-gnu"
         "/usr/lib/arm-linux-gnueabihf"
         "/usr/lib/aarch64-linux-gnu"
+        "/usr/lib32"
+        "/usr/lib64"
+        "/opt/local/lib"          # MacPorts
+        "/opt/homebrew/lib"       # Homebrew on Apple Silicon
+        "/usr/local/opt/libcurl/lib"  # Homebrew Intel
+        "/usr/local/opt/libgit2/lib"  # Homebrew Intel
+        "/sw/lib"                 # Fink
+        "/usr/pkg/lib"            # NetBSD pkgsrc
+        "/usr/local/libexec"      # Some systems put .so files here
     )
     # Library names for Unix-like systems
-    CURL_NAMES=("libcurl.so" "libcurl.so.4" "libcurl.a")
-    GIT2_NAMES=("libgit2.so" "libgit2.so.0" "libgit2.a")
+    CURL_NAMES=("libcurl.so" "libcurl.so.4" "libcurl.a" "libcurl.dylib")
+    GIT2_NAMES=("libgit2.so" "libgit2.so.0" "libgit2.a" "libgit2.dylib")
+fi
+
+# Additional search using environment variables and pkg-config
+# Check if we can get paths from pkg-config (if available)
+if command -v pkg-config &> /dev/null; then
+    if pkg-config --exists libcurl; then
+        PKGCONFIG_CURL_LIBDIR=$(pkg-config --variable=libdir libcurl)
+        PKGCONFIG_CURL_INCLUDEDIR=$(pkg-config --variable=includedir libcurl)
+        if [ -n "$PKGCONFIG_CURL_LIBDIR" ] && [ -d "$PKGCONFIG_CURL_LIBDIR" ]; then
+            SEARCH_DIRS+=("$PKGCONFIG_CURL_LIBDIR")
+        fi
+        if [ -n "$PKGCONFIG_CURL_INCLUDEDIR" ] && [ -d "$PKGCONFIG_CURL_INCLUDEDIR" ]; then
+            # We'll handle include dirs separately later
+            :
+        fi
+    fi
+    if pkg-config --exists libgit2; then
+        PKGCONFIG_GIT2_LIBDIR=$(pkg-config --variable=libdir libgit2)
+        PKGCONFIG_GIT2_INCLUDEDIR=$(pkg-config --variable=includedir libgit2)
+        if [ -n "$PKGCONFIG_GIT2_LIBDIR" ] && [ -d "$PKGCONFIG_GIT2_LIBDIR" ]; then
+            SEARCH_DIRS+=("$PKGCONFIG_GIT2_LIBDIR")
+        fi
+        if [ -n "$PKGCONFIG_GIT2_INCLUDEDIR" ] && [ -d "$PKGCONFIG_GIT2_INCLUDEDIR" ]; then
+            # We'll handle include dirs separately later
+            :
+        fi
+    fi
+fi
+
+# Add environment variable paths if they exist
+if [ -n "$LIBRARY_PATH" ]; then
+    IFS=':' read -ra LPATHS <<< "$LIBRARY_PATH"
+    for path in "${LPATHS[@]}"; do
+        if [ -d "$path" ] && [[ ! " ${SEARCH_DIRS[*]} " == *" $path "* ]]; then
+            SEARCH_DIRS+=("$path")
+        fi
+    done
+fi
+
+if [ -n "$CPLUS_INCLUDE_PATH" ]; then
+    IFS=':' read -ra IPATHS <<< "$CPLUS_INCLUDE_PATH"
+    for path in "${IPATHS[@]}"; do
+        if [ -d "$path" ] && [[ ! " ${SEARCH_DIRS[*]} " == *" $path "* ]]; then
+            # We'll handle include dirs separately
+            :
+        fi
+    done
 fi
 
 # Function to find a library (supports multiple possible names)
