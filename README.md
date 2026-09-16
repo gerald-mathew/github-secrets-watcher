@@ -19,6 +19,10 @@ A command-line tool that scans GitHub repositories (public and private with toke
 - Warns when the GitHub API rate limit is running low
 - Paginates the GitHub API using the recommended `Link` header (no manual page counting)
 - Ships a unit test suite (Catch2) covering the scanner and helpers
+- Fast history scan: walks the diff of each commit against its first parent instead of re-walking every tree, so the cost grows with the changed paths, not `depth × repository size`
+- Persistent clone cache: full history is cloned once and then only new commits are fetched on later runs (default `~/.cache/github-secrets-watcher`), so repeat scans of the same repos are much cheaper
+- Optional early-exit heuristic that stops a full-history walk after a run of commits with no new findings (opt-in)
+- Skips likely-non-secret files by extension and name: test/spec scaffolding, build artifacts (lockfiles, minified bundles, type declarations, source maps), and media/fonts/docs
 - Memory-efficient stream-based processing
 - Modern C++20 standard
 
@@ -146,7 +150,7 @@ g++ -std=c++20 -Wall -Wextra -pthread -Isrc \
 ./github_secrets_watcher scan -u YOUR_USERNAME -R "repo1,repo2,repo3"
 
 # Optional parameters (long and short forms available)
--d, --depth <NUM>      Commits to scan in history (default: 100)
+-d, --depth <NUM>      Commits to scan in history (default: 0 = all history; a positive value scans at most NUM commits)
 -m, --max-repos <NUM>  Maximum repositories to scan (default: all)
 -p, --include-private  Include private repositories (requires token)
 -n, --threads <NUM>    Number of threads to use for scanning (default: hardware concurrency)
@@ -157,9 +161,40 @@ g++ -std=c++20 -Wall -Wextra -pthread -Isrc \
 -t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)
 -r, --repo <REPO>           Scan only the specified repository
 -R, --repos <REPO1,REPO2,...>  Scan only the specified repositories (comma-separated list)
+--cache <DIR>               Cache directory for reusing full clones between runs
+                            (default: ~/.cache/github-secrets-watcher, or %LOCALAPPDATA%\github-secrets-watcher on Windows)
+--no-cache                  Always clone fresh into a temporary directory
+--early-exit <N>            Stop a full-history walk after N consecutive commits with no new findings
+                            (only applies to -d 0 scans)
+--no-early-exit             Disable the early-exit heuristic explicitly
 --dry-run                   List the repositories that would be scanned without scanning
 -y, --yes                   Skip the confirmation prompt
 ```
+
+### How scanning works
+
+For each repository the tool builds a bare clone and then walks the commit history
+from the newest reachable tip (across all branches) back towards the root:
+
+1. **Tip seeding** — files present in the newest commit are immediately credited to
+   that commit, so a file deleted yesterday is attributed correctly.
+2. **Diff walk** — every commit is compared to its first parent (an empty tree at the
+   root). Added/modified files are credited to the commit that introduced them;
+   **deleted** files are credited to the parent commit, so the reported links always
+   point at a commit where the file actually existed.
+3. **Early exit (opt-in)** — with `--early-exit N` and a full-history scan, walking
+   stops after `N` consecutive commits that change no file of interest.
+4. **Depth limit** — with `-d N`, only `N` commits are examined, using a shallow
+   fetch on the clone so bounded scans stay small.
+
+Files are only reported when their name suggests they could hold secrets (`.env`,
+`.env.*`, or names containing `config`, `settings`, or `secrets`) and the path is not
+inside an excluded directory. Files unlikely to be secrets are skipped even when the
+name matches: test/spec files (`config.test.js`, `settings.spec.ts`), build artifacts
+(`*.lock`, `*.min.js`, `*.d.ts`, `*.map`), media/fonts (`.png`, `.svg`, `.woff2`, ...),
+and documentation/templates (`.md`, `.txt`, `.rst`, `.example`, `.sample`, ...).
+Note that `.js`/`.json` configuration files (e.g. `vite.config.js`, `settings.json`)
+are reported by design — they often contain API keys — so they are not in the skip-list.
 
 **Progress Indicator:**
 When running without `--verbose`, the tool shows a real-time progress indicator:
@@ -187,7 +222,8 @@ When using `--verbose`, detailed output with timestamps is shown for each reposi
 
 Do you want to continue? (y/N): y
 [INFO] Scanning public repositories for user: Gerald-Mathew
-[INFO] History depth: 100 commits
+[INFO] History depth: all commits
+[INFO] Clone cache: %USERPROFILE%/.cache/github-secrets-watcher (reused between runs)
 [INFO] Maximum repos to scan: 5
 
 [INFO] Found 7 public repositories to scan.
@@ -225,23 +261,24 @@ Repository: CareConnect-Clinic-Appointment-System
 
 Do you want to continue? (y/N): y
 [INFO] Scanning public repositories for user: Gerald-Mathew
-[INFO] History depth: 100 commits
+[INFO] History depth: all commits
+[INFO] Clone cache: %USERPROFILE%/.cache/github-secrets-watcher (reused between runs)
 [INFO] Maximum repos to scan: 5
 
 [INFO] Found 7 public repositories to scan.
 
 [1/7] Scanning: github-secrets-watcher
-[INFO] Cloning repository (depth=100)...
+[INFO] Cloning repository into cache (full history)...
 [INFO] Scanning history...
 [OK] No potential environment files found in history.
 
 [2/7] Scanning: FlightReservation-CLI
-[INFO] Cloning repository (depth=100)...
+[INFO] Cloning repository into cache (full history)...
 [INFO] Scanning history...
 [OK] No potential environment files found in history.
 
 [3/7] Scanning: CareConnect-Clinic-Appointment-System
-[INFO] Cloning repository (depth=100)...
+[INFO] Cloning repository into cache (full history)...
 [INFO] Scanning history...
 [WARN] Found 5 potential environment/configuration files:
      - .tmp-browser-check/playwright.config.js
@@ -277,10 +314,22 @@ Do you want to continue? (y/N): y
         "path": "client(First)/assets/js/config.js",
         "commit_hash": "e537568aa7264bd1d27c6c5ba311e6440580873f"
       }
-    ]
+    ],
+    "scan": {
+      "commits_considered": 29,
+      "commits_skipped": 0,
+      "stopped_early": false,
+      "truncated_by_depth": false
+    }
   }
 ]
 ```
+
+`scan` reports per-repository statistics: how many commits were examined
+(`commits_considered`, minus any `commits_skipped` that changed nothing of
+interest), whether the early-exit heuristic stopped the walk (`stopped_early`),
+and whether history was cut short by `--depth` (`truncated_by_depth`, also set
+for bounded bare shallow clones).
 
 ### CSV Format Example
 
@@ -289,6 +338,55 @@ repo_name,success,error_message,file_path,commit_hash
 CareConnect-Clinic-Appointment-System,true,,"tmp-browser-check/playwright.config.js",5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0
 CareConnect-Clinic-Appointment-System,true,,"client(First)/assets/js/config.js",e537568aa7264bd1d27c6c5ba311e6440580873f
 ```
+
+## Performance & Trade-offs
+
+Benchmarked on this machine (Ubuntu, cmake 4.2.3, g++ 15.2.0, libgit2 1.9.1),
+scanning 3 small repositories (CareConnect-Clinic-Appointment-System, StudySync,
+FlightReservation-CLI) with 4 threads:
+
+| Scenario | Wall time | Peak RSS |
+| --- | --- | --- |
+| Old build, cold, `-d 100` (fresh shallow clone per repo) | 1.27 s | ~42.5 MB |
+| New build, cold, full history (`--no-cache`, fresh bare clone per repo) | 1.50 s | ~34.8 MB |
+| New build, warm, full history (incremental fetch via cache) | 0.39 s | ~35.4 MB |
+
+Repeat scans are about **3× faster** and the savings grow with repository size:
+a cached run only downloads the commits pushed since the last scan instead of the
+whole repository. The cold scan now does strictly more work than the old one — it
+examines *all* history instead of only 100 commits — yet stays in the same
+ballpark and uses less memory, because the new walker diffs each commit against
+its first parent (cost = changed paths) instead of re-walking every tree (cost =
+tree size) for each commit.
+
+Deliberate trade-offs, in the order they affect you:
+
+- **`--early-exit` is opt-in (off by default).** A security scan should be
+  exhaustive, so the tool never sacrifices coverage unless you say so. `--early-exit N`
+  stops a full-history walk after `N` consecutive commits that change nothing of
+  interest; a file deleted long ago *after* an otherwise-quiet stretch could be
+  missed, but for busy repos this skips the ancient, uninteresting tail. It only
+  applies to `-d 0` scans.
+- **`-d N` (bounded scans) always clone fresh.** libgit2 cannot reliably deepen a
+  shallow clone afterwards, so a bounded scan uses a fresh shallow bare clone in a
+  temporary directory; the cache is only used for `-d 0`. There is no risk of stale
+  results for bounded scans, just less reuse.
+- **The clone cache costs disk space.** Each full-history repo is stored once as a
+  bare clone under the cache directory (`~/.cache/github-secrets-watcher` by
+  default). Point `--cache` elsewhere or delete the directory to start over; the
+  cache is only ever read/written on your machine and never uploaded.
+- **Files are skipped by "cannot be a secret" heuristics.** Test/spec files
+  (`config.test.js`, `settings.spec.ts`), build artifacts (`*.lock`, `*.min.js`,
+  `*.d.ts`, `*.map`) and media/fonts/docs are ignored even when their names match.
+  This keeps noise low; a secret stored in, say, `config.png` would not be
+  reported. Configuration files themselves (`.env`, `config.js`, `settings.json`,
+  `*.yaml`, ...) are still reported by design.
+- **Merge commits are walked along the first parent only** (like `git log`). Rarely
+  matters: a secret merged through a side branch is almost always also reachable
+  through the first-parent line the tool follows.
+- **Deleted files are credited to the parent commit**, so the reported link always
+  points at a commit in which the file actually existed (the old walker pointed at
+  the deleting commit, producing links to files that were already gone).
 
 ## Safety Notes
 

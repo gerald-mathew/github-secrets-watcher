@@ -59,6 +59,20 @@ struct RepoResult {
     std::string error_message;
     std::vector<FoundFile> files;
     size_t index; // For progress tracking in output
+    // Scanner statistics (empty/false when the repo failed to prepare)
+    size_t commits_considered = 0;
+    size_t commits_skipped = 0;
+    bool stopped_early = false;
+    bool truncated_by_depth = false;
+};
+
+// Files copied out of ScanResult to build the per-repo report
+struct RepoFindings {
+    std::vector<FoundFile> files;
+    size_t commits_considered = 0;
+    size_t commits_skipped = 0;
+    bool stopped_early = false;
+    bool truncated_by_depth = false;
 };
 
 // Global variables for output configuration
@@ -137,13 +151,102 @@ private:
     fs::path path_;
 };
 
+// Credential material handed to libgit2's auth callback. Stores the token in
+// the struct so it never ends up inside the clone/fetch URL.
+struct AuthToken {
+    std::string token;
+    std::string password{"x-oauth-basic"};
+};
+
+int credential_cb(git_credential** out, const char* url, const char* username_from_url,
+                  unsigned int allowed_types, void* payload) {
+    (void)url;
+    (void)username_from_url;
+    (void)allowed_types;
+    auto* auth = static_cast<AuthToken*>(payload);
+    return git_credential_userpass_plaintext_new(out, auth->token.c_str(), auth->password.c_str());
+}
+
+// Wire the credential callback into a fetch options struct when a token is set.
+// Each network call gets a fresh credential (libgit2 frees the one we return),
+// which avoids double-frees when the server asks more than once.
+void set_fetch_credentials(git_fetch_options& opts, const std::optional<std::string>& token, AuthToken& auth) {
+    if (!token.has_value()) return;
+    auth = AuthToken{token.value()};
+    opts.callbacks.credentials = credential_cb;
+    opts.callbacks.payload = &auth;
+}
+
+// Clone into `target` (bare). Retries once after clearing the directory when a
+// partially-created clone from a previous run is in the way.
+int clone_into(const std::string& clone_url, const std::string& target,
+               const std::optional<std::string>& token, AuthToken& auth, int depth) {
+    git_clone_options clone_opts = GIT_CLONE_OPTIONS_INIT;
+    clone_opts.bare = 1; // no worktree checkout; we only read history
+    if (depth > 0) {
+        clone_opts.fetch_opts.depth = depth;
+    }
+    set_fetch_credentials(clone_opts.fetch_opts, token, auth);
+
+    git_repository* repo = nullptr;
+    int error = git_clone(&repo, clone_url.c_str(), target.c_str(), &clone_opts);
+    if (repo) git_repository_free(repo);
+
+    if (error < 0) {
+        // Clear a stale partial clone and try once more (the cache may hold a
+        // half-written repository from an interrupted earlier run).
+        std::error_code ec;
+        fs::remove_all(target, ec);
+        clone_opts = GIT_CLONE_OPTIONS_INIT;
+        clone_opts.bare = 1;
+        if (depth > 0) clone_opts.fetch_opts.depth = depth;
+        set_fetch_credentials(clone_opts.fetch_opts, token, auth);
+        error = git_clone(&repo, clone_url.c_str(), target.c_str(), &clone_opts);
+        if (repo) git_repository_free(repo);
+    }
+    return error;
+}
+
+// Fetch the latest history into an existing cached repository.
+int fetch_cached(const std::string& cache_path, const std::optional<std::string>& token, AuthToken& auth) {
+    git_repository* repo = nullptr;
+    if (git_repository_open(&repo, cache_path.c_str()) < 0) {
+        return -1;
+    }
+    git_remote* remote = nullptr;
+    int error = git_remote_lookup(&remote, repo, "origin");
+    if (error == 0) {
+        git_fetch_options fopts = GIT_FETCH_OPTIONS_INIT;
+        fopts.prune = GIT_FETCH_PRUNE;
+        fopts.download_tags = GIT_REMOTE_DOWNLOAD_TAGS_AUTO;
+        set_fetch_credentials(fopts, token, auth);
+        error = git_remote_fetch(remote, nullptr, &fopts, nullptr);
+        git_remote_free(remote);
+    }
+    git_repository_free(repo);
+    return error;
+}
+
+// Default location for the clone cache.
+fs::path default_cache_dir() {
+    if (const char* local_app = std::getenv("LOCALAPPDATA")) {
+        return fs::path(local_app) / "github-secrets-watcher";
+    }
+    const char* home = std::getenv("HOME");
+    if (!home) home = std::getenv("USERPROFILE");
+    if (home && *home) {
+        return fs::path(home) / ".cache" / "github-secrets-watcher";
+    }
+    return fs::temp_directory_path() / "github-secrets-watcher-cache";
+}
+
 // Print usage information
 void print_usage(const std::string& prog_name) {
-    std::cout << "Usage: " << prog_name << " scan -u <USERNAME> [-t <TOKEN>] [-d <DEPTH>] [-m <NUM>] [-p] [-n <NUM>] [-f <FMT>] [-o <FILE>] [-v] [-r <REPO>] [-R <REPO1,REPO2,...>] [--dry-run] [-y]\n\n";
+    std::cout << "Usage: " << prog_name << " scan -u <USERNAME> [-t <TOKEN>] [-d <DEPTH>] [-m <NUM>] [-p] [-n <NUM>] [-f <FMT>] [-o <FILE>] [-v] [-r <REPO>] [-R <REPO1,REPO2,...>] [--cache <DIR>] [--no-cache] [--early-exit <N>] [--dry-run] [-y]\n\n";
     std::cout << "Options:\n";
     std::cout << "  -u, --username <USERNAME>   GitHub username (required)\n";
     std::cout << "  -t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)\n";
-    std::cout << "  -d, --depth <NUM>           Commits to scan in history (default: 100)\n";
+    std::cout << "  -d, --depth <NUM>           Commits to scan in history (default: 0 = all history; a positive value scans at most NUM commits)\n";
     std::cout << "  -m, --max-repos <NUM>       Maximum repositories to scan (default: all)\n";
     std::cout << "  -p, --include-private       Include private repositories (requires token)\n";
     std::cout << "  -n, --threads <NUM>         Number of threads to use for scanning (default: hardware concurrency)\n";
@@ -153,12 +256,21 @@ void print_usage(const std::string& prog_name) {
     std::cout << "  -r, --repo <REPO>           Scan only the specified repository\n";
     std::cout << "  -R, --repos <REPO1,REPO2,...>\n";
     std::cout << "                              Scan only the specified repositories (comma-separated list)\n";
+    std::cout << "      --cache <DIR>           Cache directory for reusing full clones between runs\n";
+    std::cout << "                              (default: ~/.cache/github-secrets-watcher)\n";
+    std::cout << "      --no-cache              Always clone fresh into a temporary directory\n";
+    std::cout << "      --early-exit <N>        Stop a full-history walk after N consecutive commits with no new\n";
+    std::cout << "                              findings (default: off). Only applies to -d 0 scans.\n";
+    std::cout << "      --no-early-exit         Disable the early-exit heuristic explicitly\n";
     std::cout << "      --dry-run               List the repositories that would be scanned without scanning\n";
     std::cout << "  -y, --yes                   Skip the confirmation prompt\n";
 }
 
-// Function to process a single repository (cloning and scanning)
-void process_repository(const Repository& repo, int depth, const std::string& username, const std::optional<std::string>& token, size_t index, bool verbose) {
+// Prepare a local copy of a repository (cached bare clone, or a fresh bare
+// clone in a temp dir) and scan its history for env/config files.
+void process_repository(const Repository& repo, int depth, size_t early_exit,
+                        const std::string& username, const std::optional<std::string>& token,
+                        bool use_cache, const fs::path& cache_root, size_t index, bool verbose) {
     // Output status message to console (with mutex)
     if (verbose) {
         std::lock_guard<std::mutex> lock(g_console_mutex);
@@ -174,65 +286,82 @@ void process_repository(const Repository& repo, int depth, const std::string& us
         }
     }
 
-    // Temporary dir cleans itself up through RAII
-    TempDir temp(repo.name);
-
     bool success = true;
     std::string error_message;
-    std::vector<FoundFile> files;
+    RepoFindings findings;
+
+    std::unique_ptr<TempDir> temp; // only used for non-cached clones
+    AuthToken auth;
+    const bool caching = use_cache && (depth <= 0);
 
     try {
-        // Keep the token out of the clone URL so errors never leak it:
+        // Keep the token out of the clone/fetch URL so errors never leak it:
         // libgit2 calls our credentials callback when the server asks for auth.
-        std::string clone_url = "https://github.com/" + username + "/" + repo.name + ".git";
-        if (verbose) {
-            std::lock_guard<std::mutex> lock(g_console_mutex);
-            std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "Cloning repository (depth=" << depth << ")..." << std::endl;
-        }
+        const std::string clone_url = "https://github.com/" + username + "/" + repo.name + ".git";
 
-        // Clone repository using libgit2
-        git_clone_options clone_opts = GIT_CLONE_OPTIONS_INIT;
-        clone_opts.checkout_branch = nullptr; // Use default branch
+        std::string scan_path;
+        if (caching) {
+            // Persistent cache: clone once, then fetch only new commits.
+            const fs::path target = cache_root / username / repo.name;
+            std::error_code ec;
+            fs::create_directories(target.parent_path(), ec);
 
-        // Set depth if specified (shallow clone)
-        if (depth > 0) {
-            clone_opts.fetch_opts.depth = depth;
-        }
+            bool prepared = false;
+            if (fs::exists(target)) {
+                if (verbose) {
+                    std::lock_guard<std::mutex> lock(g_console_mutex);
+                    std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "Fetching latest changes into cache..." << std::endl;
+                }
+                int fetch_error = fetch_cached(target.string(), token, auth);
+                if (fetch_error < 0) {
+                    if (verbose) {
+                        std::lock_guard<std::mutex> lock(g_console_mutex);
+                        std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "Cache refresh failed, re-cloning..." << std::endl;
+                    }
+                    std::error_code fec;
+                    fs::remove_all(target, fec);
+                } else {
+                    prepared = true;
+                }
+            }
 
-        // Set up credentials if token is provided. Each callback call gets a
-        // brand new credential (libgit2 frees the one we return), avoiding
-        // double-frees when the server asks more than once.
-        if (token.has_value()) {
-            const std::string app_password = "x-oauth-basic";
-            struct auth_payload { const std::string* token; const std::string* password; };
-            auth_payload payload{ &token.value(), &app_password };
-            clone_opts.fetch_opts.callbacks.credentials = [](git_credential** out, const char* url, const char* username_from_url, unsigned int allowed_types, void* cb_payload) -> int {
-                (void)url;
-                (void)username_from_url;
-                (void)allowed_types;
-                auto* auth = static_cast<auth_payload*>(cb_payload);
-                return git_credential_userpass_plaintext_new(out, auth->token->c_str(), auth->password->c_str());
-            };
-            clone_opts.fetch_opts.callbacks.payload = &payload;
-        }
-
-        // Perform the clone
-        git_repository* cloned_repo = nullptr;
-        int error = git_clone(&cloned_repo, clone_url.c_str(), temp.path().string().c_str(), &clone_opts);
-
-        if (error < 0) {
-            const git_error* e = giterr_last();
-            std::string msg = e && e->message ? std::string(e->message) : "unknown libgit2 error";
+            if (!prepared) {
+                if (verbose) {
+                    std::lock_guard<std::mutex> lock(g_console_mutex);
+                    std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "Cloning repository into cache (full history)..." << std::endl;
+                }
+                int clone_error = clone_into(clone_url, target.string(), token, auth, 0);
+                if (clone_error < 0) {
+                    const git_error* e = giterr_last();
+                    std::string msg = e && e->message ? std::string(e->message) : "unknown libgit2 error";
+                    if (verbose) {
+                        std::lock_guard<std::mutex> lock(g_console_mutex);
+                        std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "[" << get_timestamp() << "] Git clone failed: " << msg << std::endl;
+                    }
+                    throw std::runtime_error("Git clone failed: " + msg);
+                }
+                prepared = true;
+            }
+            scan_path = target.string();
+        } else {
+            // Bounded depth: a fresh shallow bare clone each run.
+            temp = std::make_unique<TempDir>(repo.name);
+            scan_path = temp->path().string();
             if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
-                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "[" << get_timestamp() << "] Git clone failed: " << msg << std::endl;
+                std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET
+                          << "Cloning repository (depth=" << depth << ")..." << std::endl;
             }
-            throw std::runtime_error("Git clone failed: " + msg);
-        }
-
-        // Cleanup cloned repository handle (we don't need to keep it open)
-        if (cloned_repo) {
-            git_repository_free(cloned_repo);
+            int clone_error = clone_into(clone_url, scan_path, token, auth, depth);
+            if (clone_error < 0) {
+                const git_error* e = giterr_last();
+                std::string msg = e && e->message ? std::string(e->message) : "unknown libgit2 error";
+                if (verbose) {
+                    std::lock_guard<std::mutex> lock(g_console_mutex);
+                    std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "[" << get_timestamp() << "] Git clone failed: " << msg << std::endl;
+                }
+                throw std::runtime_error("Git clone failed: " + msg);
+            }
         }
 
         // Scan history for env-like files
@@ -240,14 +369,23 @@ void process_repository(const Repository& repo, int depth, const std::string& us
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "[" << get_timestamp() << "] Scanning history..." << std::endl;
         }
-        std::map<std::string, std::string> file_to_commit = scanner::scan_repo_history(temp.path().string(), depth);
+        scanner::ScanResult scan = scanner::scan_repo_history(scan_path, depth, early_exit);
 
-        if (!file_to_commit.empty()) {
+        findings.commits_considered = scan.commits_considered;
+        findings.commits_skipped = scan.commits_skipped;
+        findings.stopped_early = scan.stopped_early;
+        // A bounded scan uses a shallow fetch, so older commits beyond --depth
+        // were never downloaded even if they exist.
+        findings.truncated_by_depth = scan.truncated_by_depth || (depth > 0);
+
+        if (!scan.file_to_commit.empty()) {
             if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
-                std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "[" << get_timestamp() << "] Found " << file_to_commit.size() << " potential environment/configuration files:" << std::endl;
+                std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "[" << get_timestamp() << "] Found " << scan.file_to_commit.size()
+                          << " potential environment/configuration files (walked " << scan.commits_considered
+                          << " commits, skipped " << scan.commits_skipped << " unchanged):" << std::endl;
             }
-            for (const auto& [file_path, commit_hash] : file_to_commit) {
+            for (const auto& [file_path, commit_hash] : scan.file_to_commit) {
                 // Validate commit hash format (40 hex characters)
                 if (!utils::is_valid_commit_hash(commit_hash)) {
                     if (verbose) {
@@ -270,13 +408,26 @@ void process_repository(const Repository& repo, int depth, const std::string& us
                 }
 
                 // Add to our local files vector
-                files.push_back({file_path, commit_hash});
+                findings.files.push_back({file_path, commit_hash});
             }
         } else {
             if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
                 std::cerr << COLOR_OK << "[OK] " << COLOR_RESET << "No potential environment files found in history." << std::endl;
             }
+        }
+
+        if (verbose && scan.stopped_early) {
+            std::lock_guard<std::mutex> lock(g_console_mutex);
+            std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET
+                      << "History walk stopped early (" << scan.commits_considered
+                      << " commits examined; --early-exit heuristic)." << std::endl;
+        }
+        if (verbose && scan.truncated_by_depth) {
+            std::lock_guard<std::mutex> lock(g_console_mutex);
+            std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET
+                      << "History walk truncated by --depth (" << scan.commits_considered
+                      << " commits examined)." << std::endl;
         }
 
     } catch (const std::exception& e) {
@@ -298,7 +449,9 @@ void process_repository(const Repository& repo, int depth, const std::string& us
     // Add the result to the global results
     {
         std::lock_guard<std::mutex> lock(g_results_mutex);
-        g_results.push_back({repo.name, repo.html_url, success, error_message, files, index});
+        g_results.push_back({repo.name, repo.html_url, success, error_message, findings.files, index,
+                             findings.commits_considered, findings.commits_skipped,
+                             findings.stopped_early, findings.truncated_by_depth});
     }
 }
 
@@ -317,6 +470,12 @@ void output_results(bool verbose) {
                 if (!r.error_message.empty()) {
                     entry["error_message"] = r.error_message;
                 }
+                entry["scan"] = {
+                    {"commits_considered", r.commits_considered},
+                    {"commits_skipped", r.commits_skipped},
+                    {"stopped_early", r.stopped_early},
+                    {"truncated_by_depth", r.truncated_by_depth},
+                };
                 nlohmann::json files = nlohmann::json::array();
                 for (const auto& f : r.files) {
                     files.push_back({{"path", f.path}, {"commit_hash", f.commit_hash}});
@@ -415,7 +574,7 @@ int main(int argc, char* argv[]) {
     // Parse arguments
     std::string username;
     std::optional<std::string> token = std::nullopt;
-    int depth = 100;
+    int depth = 0; // 0 = entire reachable history
     std::optional<int> max_repos = std::nullopt;
     bool include_private = false;
     bool verbose = false;
@@ -425,6 +584,9 @@ int main(int argc, char* argv[]) {
     if (thread_count <= 0) thread_count = 4; // fallback
     OutputFormat format = OutputFormat::Text;
     std::string output_file;
+    size_t early_exit = 0; // 0 = disabled; >0 = stop after N quiet commits (-d 0 only)
+    bool use_cache = true;
+    fs::path cache_dir = default_cache_dir();
     // Repo selection options
     std::optional<std::string> selected_repo;
     std::optional<std::vector<std::string>> selected_repos_list;
@@ -450,14 +612,39 @@ int main(int argc, char* argv[]) {
             }
             try {
                 depth = std::stoi(argv[++i]);
-                if (depth <= 0) {
-                    std::cerr << "Error: --depth must be positive\n";
+                if (depth < 0) {
+                    std::cerr << "Error: --depth must not be negative (0 = all history)\n";
                     return 1;
                 }
             } catch (const std::exception&) {
                 std::cerr << "Error: --depth must be a number\n";
                 return 1;
             }
+        } else if (arg == "--cache") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --cache requires a value\n";
+                return 1;
+            }
+            cache_dir = fs::path(argv[++i]);
+        } else if (arg == "--no-cache") {
+            use_cache = false;
+        } else if (arg == "--early-exit") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --early-exit requires a value\n";
+                return 1;
+            }
+            try {
+                early_exit = static_cast<size_t>(std::stoul(argv[++i]));
+                if (early_exit == 0) {
+                    std::cerr << "Error: --early-exit must be at least 1 (use --no-early-exit to disable)\n";
+                    return 1;
+                }
+            } catch (const std::exception&) {
+                std::cerr << "Error: --early-exit must be a number\n";
+                return 1;
+            }
+        } else if (arg == "--no-early-exit") {
+            early_exit = 0;
         } else if (arg == "--max-repos" || arg == "-m") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --max-repos requires a value\n";
@@ -598,7 +785,19 @@ int main(int argc, char* argv[]) {
 
     try {
         std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning " << (include_private ? "public and private" : "public") << " repositories for user: " << username << "\n";
-        std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "History depth: " << depth << " commits\n";
+        if (depth <= 0) {
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "History depth: all commits\n";
+        } else {
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "History depth: " << depth << " commits\n";
+        }
+        if (use_cache && depth <= 0) {
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Clone cache: " << cache_dir.string() << " (reused between runs)\n";
+        } else {
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Clone cache: disabled (fresh temporary clones)\n";
+        }
+        if (early_exit > 0) {
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Early exit: stop after " << early_exit << " commits with no new findings\n";
+        }
         if (max_repos.has_value()) {
             std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Maximum repos to scan: " << max_repos.value() << "\n";
         }
@@ -690,7 +889,7 @@ int main(int argc, char* argv[]) {
 
             size_t index = 0;
             for (const auto& repo : filtered_repos) {
-                pool.enqueue(process_repository, repo, depth, username, token, index, verbose);
+                pool.enqueue(process_repository, repo, depth, early_exit, username, token, use_cache, cache_dir, index, verbose);
                 index++;
             }
             // pool goes out of scope here, waiting for all threads
