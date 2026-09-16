@@ -2,6 +2,9 @@
 *.exe
 *.o
 *.a
+/build/
+!/build/build.sh
+!/build/build.bat
 
 # Temporary files
 *.tmp

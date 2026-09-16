@@ -14,6 +14,11 @@ A command-line tool that scans GitHub repositories (public and private with toke
 - Multi-threaded repository scanning for improved performance (configurable thread count)
 - Configurable output formats: human-readable text, machine-readable JSON, or CSV
 - Colored terminal output for better readability (ANSI colors, Windows VT processing enabled)
+- `--dry-run` to preview which repositories would be scanned (no cloning)
+- `--yes` to skip the confirmation prompt (handy for scripts/CI)
+- Warns when the GitHub API rate limit is running low
+- Paginates the GitHub API using the recommended `Link` header (no manual page counting)
+- Ships a unit test suite (Catch2) covering the scanner and helpers
 - Memory-efficient stream-based processing
 - Modern C++20 standard
 
@@ -62,11 +67,18 @@ pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-libcurl mingw-w64-x86_64-l
 ### Using CMake (recommended)
 
 ```bash
-mkdir build && cd build
-cmake ..
-make
-# The executable will be in the current directory
+# from the repository root
+cmake -B build -DBUILD_TESTING=ON
+cmake --build build --parallel
+
+# run the unit tests
+ctest --test-dir build --output-on-failure
+
+# The executable will be build/github_secrets_watcher
 ```
+
+> `libgit2` has no CMake config, so CMake locates it via `pkg-config`
+> (same as libcurl). `BUILD_TESTING` is ON by default.
 
 ### Using the provided build script (Linux/macOS/WSL/MSYS2)
 
@@ -86,11 +98,15 @@ build.bat
 ### Manual compilation
 
 ```bash
-g++ -std=c++20 -Wall -Wextra -Isrc \
+g++ -std=c++20 -Wall -Wextra -pthread -Isrc \
     src/main.cpp src/github.cpp src/scanner.cpp src/utils.cpp \
-    $(pkg-config --cflags --libs libcurl) \
+    $(pkg-config --cflags --libs libcurl libgit2) \
     -o github_secrets_watcher
 ```
+
+> Both libs are needed for linking: `-lcurl` is pulled in by `pkg-config libcurl`
+> and `libgit2` (with `-pthread`) by `pkg-config libgit2`. Forgetting `libgit2`
+> produces undefined references to `git_*` symbols.
 
 ## Usage
 
@@ -115,6 +131,12 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 # Enable verbose output (shows detailed progress for each repository with timestamps)
 ./github_secrets_watcher scan -u YOUR_USERNAME -v
 
+# Preview what would be scanned without actually scanning
+./github_secrets_watcher scan -u YOUR_USERNAME --dry-run
+
+# Skip the confirmation prompt (for scripts/CI)
+./github_secrets_watcher scan -u YOUR_USERNAME -y
+
 # Scan only a specific repository
 ./github_secrets_watcher scan -u YOUR_USERNAME --repo REPO_NAME
 ./github_secrets_watcher scan -u YOUR_USERNAME -r REPO_NAME
@@ -135,6 +157,8 @@ g++ -std=c++20 -Wall -Wextra -Isrc \
 -t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)
 -r, --repo <REPO>           Scan only the specified repository
 -R, --repos <REPO1,REPO2,...>  Scan only the specified repositories (comma-separated list)
+--dry-run                   List the repositories that would be scanned without scanning
+-y, --yes                   Skip the confirmation prompt
 ```
 
 **Progress Indicator:**
@@ -272,6 +296,38 @@ CareConnect-Clinic-Appointment-System,true,,"client(First)/assets/js/config.js",
 - Tool performs read-only operations only (no modifications)
 - Intended for defensive security awareness and learning
 - Review what the tool does before running it on any repositories
+
+## Troubleshooting
+
+**`undefined reference to git_*` at link time** — you are missing `-lgit2` (and usually `-pthread`). Use the `pkg-config libgit2` flags as shown in the manual compile command.
+
+**`Fail: GitHub user not found` but the user exists** — GitHub renamed the user, or the username is case-sensitive/typo'd. Check the exact name on the profile URL.
+
+**`GitHub API returned HTTP 403`** — you ran out of API rate limit. Do not scan too many large repos back-to-back; supply a `--token` for a much higher limit.
+
+**`Git clone failed: authentication failed` when using `--include-private`** — the token is missing, expired, or lacks `repo` scope. Regenerate it with repo access. Your token is never embedded in the clone URL, so it cannot leak through error output.
+
+**`CMake Error: Could not find a package configuration file for "Catch2"`** — install Catch2 (`catch2` on Debian/Ubuntu, `catch2` on Homebrew) or configure with `-DBUILD_TESTING=OFF` to skip the tests.
+
+## Project Structure
+
+```
+.
+├── CMakeLists.txt          # build definition (pkg-config for libcurl/libgit2)
+├── build/
+│   ├── build.sh            # Unix/macOS/MSYS2 build script
+│   └── build.bat           # Windows (MSVC) build script
+├── src/
+│   ├── main.cpp            # CLI entry point, output formats
+│   ├── github.cpp/hpp      # GitHub REST API client (Link-header pagination)
+│   ├── scanner.cpp/hpp     # git history scanner (libgit2)
+│   ├── thread_pool.hpp     # parallel worker pool
+│   ├── utils.cpp/hpp       # URL/CSV helpers, link parsing
+│   └── json.hpp            # vendored nlohmann/json (single header)
+└── tests/
+    ├── utils.test.cpp      # helpers + CSV/Link-header parsing
+    └── scanner.test.cpp    # integration-style tests against a real git repo
+```
 
 ## License
 
