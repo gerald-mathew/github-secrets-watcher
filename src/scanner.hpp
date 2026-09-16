@@ -9,6 +9,14 @@ namespace scanner {
         // file_path -> commit hash of the most recent commit where the file existed
         std::map<std::string, std::string> file_to_commit;
 
+        // file_path -> true for the paths in file_to_commit whose content at
+        // that commit matched secret-shaped patterns (assignment of a
+        // non-placeholder value to a key/token/secret/password, or a known
+        // credential format such as AWS/GitHub/Stripe tokens, JWTs, private
+        // keys). Paths absent here were flagged on name alone: worth a
+        // manual review, but ranked below the high-confidence leaks.
+        std::map<std::string, bool> likely_secret;
+
         // Commits whose diff was examined (or whose tree matched the parent,
         // so no diff work was needed).
         size_t commits_considered = 0;

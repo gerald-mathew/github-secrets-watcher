@@ -38,6 +38,14 @@ namespace scanner {
                basename.find(".spec.") != std::string::npos;
     }
 
+    // The penv-style file class: a schema that describes the shape of the
+    // environment (names and types) without any values. It must never be
+    // reported as a leak - it is the *expected* companion to a secret-less
+    // working tree.
+    static bool is_schema_file(const std::string& basename) {
+        return basename.find(".schema") != std::string::npos;
+    }
+
     // Safe accessor for libgit2's last error (giterr_last may return nullptr)
     static std::string git_error_message() {
         const git_error* e = giterr_last();
@@ -61,6 +69,9 @@ namespace scanner {
         if (is_test_file(basename)) {
             return false;
         }
+        if (is_schema_file(basename)) {
+            return false;
+        }
 
         for (const std::string& ext : SAFE_EXTENSIONS) {
             if (basename.size() >= ext.size() &&
@@ -71,15 +82,70 @@ namespace scanner {
         return true;
     }
 
+    // Content-level confidence for a matched file. Name matches alone deserve a
+    // review; a file whose bytes also look like real credentials is the
+    // high-confidence class and should be acted on first.
+    static bool oid_is_zero(const git_oid* oid) {
+        for (size_t i = 0; i < sizeof(oid->id); ++i) {
+            if (oid->id[i] != 0) return false;
+        }
+        return true;
+    }
+
+    static bool looks_like_secret_text(const char* data, size_t size) {
+        if (data == nullptr || size == 0) return false;
+        const size_t kProbeLimit = 64 * 1024; // a needle is near the top
+        const std::string text(data, std::min(size, kProbeLimit));
+        if (text.find('\0') != std::string::npos) return false; // not text
+
+        // key/token/secret/password assigned a value that is not a placeholder
+        static const std::regex assignment(
+            R"(\b(api[_-]?key|access[_-]?key|secret|password|passwd|passphrase|token|auth|credential)s?\b\s*[=:]\s*["']?([^\s"',;}]+))",
+            std::regex::icase);
+        static const std::regex placeholder(
+            R"(^(<[^>]*>|your[_-].*|change[_-]?me.*|example.*|xxx+|\*+|\.\.\.+|todo.*|fill[_-]?in.*|rep[a-z]*lac[a-z]*.*|none|null|false|true|0|1|n/a|na|empty|test.*)$)",
+            std::regex::icase);
+        // tokens whose format identifies them regardless of the surrounding name
+        static const std::regex known_formats(
+            R"((AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk_live_[0-9A-Za-z]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{9,}\.[A-Za-z0-9_-]{9,}|-----BEGIN ([A-Z0-9 ':]*)?PRIVATE KEY-----))",
+            std::regex::icase);
+
+        std::smatch m;
+        std::string::const_iterator it = text.cbegin();
+        while (it != text.cend() && std::regex_search(it, text.cend(), m, assignment)) {
+            const std::string value = m[2].str();
+            if (value.size() >= 3 && !std::regex_match(value, placeholder)) {
+                return true;
+            }
+            it = m[0].second;
+        }
+        return std::regex_search(text, known_formats);
+    }
+
+    // Best-effort probe: resolve a blob and run the content heuristic. The
+    // object may be missing in shallow clones (a deleted file's blob lives in
+    // the parent tree), in which case nothing is concluded.
+    static bool blob_looks_secret(git_repository* repo, const git_oid* oid) {
+        if (oid == nullptr || oid_is_zero(oid)) return false;
+        git_blob* blob = nullptr;
+        if (git_blob_lookup(&blob, repo, oid) < 0) return false;
+        const char* data = static_cast<const char*>(git_blob_rawcontent(blob));
+        const bool secret = looks_like_secret_text(data, git_blob_rawsize(blob));
+        git_blob_free(blob);
+        return secret;
+    }
+
     struct SeedContext {
         ScanResult* result;
         const std::string* tip_hash;
+        git_repository* repo;
     };
 
     struct DeltaContext {
         ScanResult* result;
         const std::string* current_hash;
         const std::string* deleted_hash;
+        git_repository* repo;
     };
 
     // Tree-walk callback used once to seed the result from the newest tip: a
@@ -99,6 +165,10 @@ namespace scanner {
 
         if (looks_interesting(normalized_path)) {
             ctx->result->file_to_commit[normalized_path] = *ctx->tip_hash;
+            if (git_tree_entry_filemode(entry) != GIT_FILEMODE_TREE &&
+                blob_looks_secret(ctx->repo, git_tree_entry_id(entry))) {
+                ctx->result->likely_secret[normalized_path] = true;
+            }
         }
         return 0;
     }
@@ -125,8 +195,14 @@ namespace scanner {
 
         if (delta->status == GIT_DELTA_DELETED) {
             ctx->result->file_to_commit[std::string(path)] = *ctx->deleted_hash;
+            if (blob_looks_secret(ctx->repo, &delta->old_file.id)) {
+                ctx->result->likely_secret[std::string(path)] = true;
+            }
         } else {
             ctx->result->file_to_commit[std::string(path)] = *ctx->current_hash;
+            if (blob_looks_secret(ctx->repo, &delta->new_file.id)) {
+                ctx->result->likely_secret[std::string(path)] = true;
+            }
         }
         return 0;
     }
@@ -217,7 +293,7 @@ namespace scanner {
                 // exist, so this is their most recent known commit. The tip is
                 // also often the commit that deleted an older file, so its diff
                 // is still examined below.
-                SeedContext ctx{&result, &current_hash};
+                SeedContext ctx{&result, &current_hash, repo};
                 git_tree_walk(tree, GIT_TREEWALK_PRE, seed_tree_cb, &ctx);
                 seeded = true;
             }
@@ -264,7 +340,7 @@ namespace scanner {
             git_diff* diff = nullptr;
             git_diff_options diff_opts = GIT_DIFF_OPTIONS_INIT;
             if (git_diff_tree_to_tree(&diff, repo, parent_tree, tree, &diff_opts) == 0 && diff != nullptr) {
-                DeltaContext ctx{&result, &current_hash, &deleted_hash};
+                DeltaContext ctx{&result, &current_hash, &deleted_hash, repo};
                 git_diff_foreach(diff, delta_cb, nullptr, nullptr, nullptr, &ctx);
                 git_diff_free(diff);
             }

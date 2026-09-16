@@ -126,11 +126,39 @@ namespace github {
                 throw std::runtime_error("GitHub user not found: " + username);
             }
             if (response.status_code != 200) {
-                // Rate limit exceeded or other API error.
+                // Report what the API actually told us. GitHub answers a 403
+                // both when the rate limit ran out and when the token is
+                // missing/expired/lacks scope, so reuse the response body's
+                // `message` and the rate-limit headers to pick the right cause.
+                std::string api_message;
+                try {
+                    nlohmann::json err = nlohmann::json::parse(response.body);
+                    api_message = err.value("message", "");
+                } catch (...) {
+                    api_message.clear();
+                }
+
+                const bool rate_limited =
+                    response.headers.rate_limit_remaining == "0" ||
+                    api_message.find("rate limit") != std::string::npos;
+                const bool auth_issue =
+                    api_message.find("Bad credentials") != std::string::npos ||
+                    api_message.find("Requires authentication") != std::string::npos ||
+                    api_message.find("personal access token") != std::string::npos ||
+                    api_message.find("Repository access blocked") != std::string::npos ||
+                    api_message.find("access denied") != std::string::npos;
+
                 std::ostringstream msg;
                 msg << "GitHub API returned HTTP " << response.status_code;
-                if (!response.headers.rate_limit_reset.empty()) {
+                if (!api_message.empty()) {
+                    msg << " - " << api_message;
+                }
+                if (rate_limited && !response.headers.rate_limit_reset.empty()) {
                     msg << " (rate limit reset at " << response.headers.rate_limit_reset << ")";
+                }
+                if (auth_issue) {
+                    msg << ". Provide a valid --token with the repo scope to authenticate"
+                        << " when scanning private/unlisted repositories.";
                 }
                 throw std::runtime_error(msg.str());
             }

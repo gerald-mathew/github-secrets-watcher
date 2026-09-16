@@ -23,6 +23,8 @@ A command-line tool that scans GitHub repositories (public and private with toke
 - Persistent clone cache: full history is cloned once and then only new commits are fetched on later runs (default `~/.cache/github-secrets-watcher`), so repeat scans of the same repos are much cheaper
 - Optional early-exit heuristic that stops a full-history walk after a run of commits with no new findings (opt-in)
 - Skips likely-non-secret files by extension and name: test/spec scaffolding, build artifacts (lockfiles, minified bundles, type declarations, source maps), and media/fonts/docs
+- Content-aware confidence: files whose contents look like real credentials (non-placeholder assignments to `key`/`token`/`secret`/`password`, AWS/GitHub/Stripe tokens, JWTs, private keys) are ranked above files flagged on name alone
+- Reports GitHub API errors with the actual cause (rate limit vs. bad/insufficient token) instead of a generic HTTP code
 - Memory-efficient stream-based processing
 - Modern C++20 standard
 
@@ -182,19 +184,26 @@ from the newest reachable tip (across all branches) back towards the root:
    root). Added/modified files are credited to the commit that introduced them;
    **deleted** files are credited to the parent commit, so the reported links always
    point at a commit where the file actually existed.
-3. **Early exit (opt-in)** — with `--early-exit N` and a full-history scan, walking
+3. **Content probe** — each reported file's bytes at that commit are checked against
+   secret-shaped patterns. Files that match (a non-placeholder value assigned to a
+   `key`/`token`/`secret`/`password`, or a known credential format such as AWS,
+   GitHub PAT, Stripe `sk_live_`, JWT, or a private key) are marked
+   `likely_secret`; everything else is a name-only flag waiting for a manual review.
+4. **Early exit (opt-in)** — with `--early-exit N` and a full-history scan, walking
    stops after `N` consecutive commits that change no file of interest.
-4. **Depth limit** — with `-d N`, only `N` commits are examined, using a shallow
+5. **Depth limit** — with `-d N`, only `N` commits are examined, using a shallow
    fetch on the clone so bounded scans stay small.
 
 Files are only reported when their name suggests they could hold secrets (`.env`,
 `.env.*`, or names containing `config`, `settings`, or `secrets`) and the path is not
 inside an excluded directory. Files unlikely to be secrets are skipped even when the
-name matches: test/spec files (`config.test.js`, `settings.spec.ts`), build artifacts
-(`*.lock`, `*.min.js`, `*.d.ts`, `*.map`), media/fonts (`.png`, `.svg`, `.woff2`, ...),
-and documentation/templates (`.md`, `.txt`, `.rst`, `.example`, `.sample`, ...).
-Note that `.js`/`.json` configuration files (e.g. `vite.config.js`, `settings.json`)
-are reported by design — they often contain API keys — so they are not in the skip-list.
+name matches: test/spec files (`config.test.js`, `settings.spec.ts`), schema files
+(`.env.schema`, `appsettings.schema.json` — the value-less env *shape*, not a leak),
+build artifacts (`*.lock`, `*.min.js`, `*.d.ts`, `*.map`), media/fonts (`.png`, `.svg`,
+`.woff2`, ...), and documentation/templates (`.md`, `.txt`, `.rst`, `.example`,
+`.sample`, ...). Note that `.js`/`.json` configuration files (e.g. `vite.config.js`,
+`settings.json`) are reported by design — they often contain API keys — so they are
+not in the skip-list.
 
 **Progress Indicator:**
 When running without `--verbose`, the tool shows a real-time progress indicator:
@@ -308,11 +317,13 @@ Do you want to continue? (y/N): y
     "files": [
       {
         "path": ".tmp-browser-check/playwright.config.js",
-        "commit_hash": "5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0"
+        "commit_hash": "5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0",
+        "likely_secret": false
       },
       {
         "path": "client(First)/assets/js/config.js",
-        "commit_hash": "e537568aa7264bd1d27c6c5ba311e6440580873f"
+        "commit_hash": "e537568aa7264bd1d27c6c5ba311e6440580873f",
+        "likely_secret": true
       }
     ],
     "scan": {
@@ -334,9 +345,9 @@ for bounded bare shallow clones).
 ### CSV Format Example
 
 ```csv
-repo_name,success,error_message,file_path,commit_hash
-CareConnect-Clinic-Appointment-System,true,,"tmp-browser-check/playwright.config.js",5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0
-CareConnect-Clinic-Appointment-System,true,,"client(First)/assets/js/config.js",e537568aa7264bd1d27c6c5ba311e6440580873f
+repo_name,success,error_message,file_path,commit_hash,likely_secret
+CareConnect-Clinic-Appointment-System,true,,tmp-browser-check/playwright.config.js,5d580e41d2fd7b6c2b45e29b3250927dc0f3a4a0,false
+CareConnect-Clinic-Appointment-System,true,,client(First)/assets/js/config.js,e537568aa7264bd1d27c6c5ba311e6440580873f,true
 ```
 
 ## Performance & Trade-offs
@@ -401,7 +412,9 @@ Deliberate trade-offs, in the order they affect you:
 
 **`Fail: GitHub user not found` but the user exists** — GitHub renamed the user, or the username is case-sensitive/typo'd. Check the exact name on the profile URL.
 
-**`GitHub API returned HTTP 403`** — you ran out of API rate limit. Do not scan too many large repos back-to-back; supply a `--token` for a much higher limit.
+**`GitHub API returned HTTP 403 - rate limit exceeded`** — you ran out of API rate limit. The error includes a reset time when GitHub provides one. Supply a `--token` to raise your limit.
+
+**`GitHub API returned HTTP 403 - Bad credentials`** (or `Resource not accessible by personal access token`) — your token is missing, expired, or lacks the `repo` scope. Regenerate it with the full `repo` scope to scan private repositories. A missing `--token` also prevents listing private repos even when `--include-private` is set; the tool prints a warning in that case.
 
 **`Git clone failed: authentication failed` when using `--include-private`** — the token is missing, expired, or lacks `repo` scope. Regenerate it with repo access. Your token is never embedded in the clone URL, so it cannot leak through error output.
 
