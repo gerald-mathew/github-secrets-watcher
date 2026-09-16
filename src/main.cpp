@@ -49,6 +49,7 @@ enum class OutputFormat {
 struct FoundFile {
     std::string path;
     std::string commit_hash;
+    bool likely_secret = false;
 };
 
 // Structure to hold the result of scanning a repository
@@ -379,10 +380,13 @@ void process_repository(const Repository& repo, int depth, size_t early_exit,
         findings.truncated_by_depth = scan.truncated_by_depth || (depth > 0);
 
         if (!scan.file_to_commit.empty()) {
+            size_t likely_count = scan.likely_secret.size();
             if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
                 std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "[" << get_timestamp() << "] Found " << scan.file_to_commit.size()
-                          << " potential environment/configuration files (walked " << scan.commits_considered
+                          << " potential environment/configuration files"
+                          << (likely_count > 0 ? " (" + std::to_string(likely_count) + " likely secret" + (likely_count != 1 ? "s" : "") + ")" : "")
+                          << " (walked " << scan.commits_considered
                           << " commits, skipped " << scan.commits_skipped << " unchanged):" << std::endl;
             }
             for (const auto& [file_path, commit_hash] : scan.file_to_commit) {
@@ -403,12 +407,17 @@ void process_repository(const Repository& repo, int depth, size_t early_exit,
 
                 if (verbose) {
                     std::lock_guard<std::mutex> lock(g_console_mutex);
-                    std::cerr << "     - " << file_path << std::endl;
+                    std::cerr << "     - " << file_path;
+                    if (scan.likely_secret.count(file_path)) {
+                        std::cerr << " (likely secret)";
+                    }
+                    std::cerr << std::endl;
                     std::cerr << "       " << COLOR_LINK << "[LINK] " << COLOR_RESET << file_url << std::endl;
                 }
 
                 // Add to our local files vector
-                findings.files.push_back({file_path, commit_hash});
+                findings.files.push_back({file_path, commit_hash,
+                                          scan.likely_secret.count(file_path) > 0});
             }
         } else {
             if (verbose) {
@@ -478,7 +487,9 @@ void output_results(bool verbose) {
                 };
                 nlohmann::json files = nlohmann::json::array();
                 for (const auto& f : r.files) {
-                    files.push_back({{"path", f.path}, {"commit_hash", f.commit_hash}});
+                    files.push_back({{"path", f.path},
+                                     {"commit_hash", f.commit_hash},
+                                     {"likely_secret", f.likely_secret}});
                 }
                 entry["files"] = files;
                 out.push_back(entry);
@@ -490,16 +501,16 @@ void output_results(bool verbose) {
             // RFC 4180: fields containing , " or newlines are quoted and
             // embedded quotes are doubled
             auto field = [](const std::string& s) { return utils::csv_escape(s); };
-            *g_output_stream << "repo_name,success,error_message,file_path,commit_hash\n";
+            *g_output_stream << "repo_name,success,error_message,file_path,commit_hash,likely_secret\n";
             for (const auto& r : g_results) {
                 if (r.files.empty()) {
                     *g_output_stream << field(r.repo_name) << "," << (r.success ? "true" : "false") << ","
-                                     << field(r.error_message) << ",,\n";
+                                     << field(r.error_message) << ",,,\n";
                 } else {
                     for (const auto& f : r.files) {
                         *g_output_stream << field(r.repo_name) << "," << (r.success ? "true" : "false") << ","
                                          << field(r.error_message) << "," << field(f.path) << ","
-                                         << field(f.commit_hash) << "\n";
+                                         << field(f.commit_hash) << "," << (f.likely_secret ? "true" : "false") << "\n";
                     }
                 }
             }
@@ -523,9 +534,14 @@ void output_results(bool verbose) {
                 if (r.files.empty()) {
                     *g_output_stream << "  No potential environment files found.\n";
                 } else {
-                    *g_output_stream << "  Found " << r.files.size() << " potential environment/configuration files:\n";
+                    size_t likely = 0;
+                    for (const auto& f : r.files) likely += f.likely_secret ? 1 : 0;
+                    *g_output_stream << "  Found " << r.files.size() << " potential environment/configuration files"
+                                     << (likely > 0 ? " (" + std::to_string(likely) + " likely secret" + (likely != 1 ? "s" : "") + ")" : "")
+                                     << ":\n";
                     for (const auto& f : r.files) {
-                        *g_output_stream << "    - " << f.path << "\n";
+                        *g_output_stream << "    - " << f.path
+                                         << (f.likely_secret ? " (likely secret)" : "") << "\n";
                         std::string repo_url = utils::remove_trailing_slash(r.html_url);
                         std::string encoded_file_path = utils::url_encode(f.path);
                         std::string file_url = repo_url + "/blob/" + f.commit_hash + "/" + encoded_file_path;
@@ -749,7 +765,9 @@ int main(int argc, char* argv[]) {
 
     // Warn if trying to access private repos without token
     if (include_private && !token.has_value()) {
-        std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "Warning: --include-private requires a GitHub token for authentication\n";
+        std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "--include-private has no effect without --token; "
+                  << "GitHub never lists private repositories for anonymous requests. "
+                  << "Supply a personal access token to scan them.\n";
         std::cerr << "         Falling back to public repositories only.\n";
         include_private = false;
     }
@@ -784,7 +802,8 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning " << (include_private ? "public and private" : "public") << " repositories for user: " << username << "\n";
+        std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning " << (include_private ? "public and private" : "public")
+                  << " repositories for user: " << username << "\n";
         if (depth <= 0) {
             std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "History depth: all commits\n";
         } else {

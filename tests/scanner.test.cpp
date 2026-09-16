@@ -157,6 +157,64 @@ TEST_CASE("scan_repo_history ignores build, media, and doc files that cannot be 
     git_libgit2_shutdown();
 }
 
+TEST_CASE("scan_repo_history ignores .env.schema files (penv-style schema files)") {
+    REQUIRE(git_libgit2_init() >= 1);
+
+    git_repository* repo = nullptr;
+    fs::path dir = make_temp_repo(&repo);
+
+    write_file(dir, ".env.schema", "DB_HOST: string\nDB_PORT: number\n");
+    write_file(dir, "appsettings.schema.json", "{\n  \"ConnectionStrings\": { \"Default\": { \"type\": \"string\" } }\n}\n");
+    write_file(dir, ".env", "DB_HOST=localhost\nDB_PORT=5432\n");
+
+    make_commit(repo, "test@example.com", "schema + runtime env");
+    git_repository_free(repo);
+
+    auto found = scanner::scan_repo_history(dir.string(), 0, 0);
+    REQUIRE(found.file_to_commit.count(".env.schema") == 0);
+    REQUIRE(found.file_to_commit.count("appsettings.schema.json") == 0);
+    REQUIRE(found.file_to_commit.count(".env") == 1);
+
+    fs::remove_all(dir);
+    git_libgit2_shutdown();
+}
+
+TEST_CASE("scan_repo_history content-probes files and ranks likely-secrets") {
+    REQUIRE(git_libgit2_init() >= 1);
+
+    git_repository* repo = nullptr;
+    fs::path dir = make_temp_repo(&repo);
+
+    write_file(dir, ".env", "DB_HOST=localhost\n");
+    write_file(dir, "app.env", "API_KEY=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\n");
+    write_file(dir, "settings.js", "export const token = '9f86d081884c7d659a2feaa0c55ad015a';\n");
+    // standard HS256 sample JWT: exercises the known-format branch
+    write_file(dir, "token.env", "SESSION=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U\n");
+    write_file(dir, "secrets.json", "{\n  \"placeholder\": \"changeme\"\n}\n");
+
+    make_commit(repo, "test@example.com", "initial content");
+    git_repository_free(repo);
+
+    auto found = scanner::scan_repo_history(dir.string(), 0, 0);
+    REQUIRE(found.file_to_commit.count(".env") == 1);
+    REQUIRE(found.file_to_commit.count("app.env") == 1);
+    REQUIRE(found.file_to_commit.count("settings.js") == 1);
+    REQUIRE(found.file_to_commit.count("token.env") == 1);
+    REQUIRE(found.file_to_commit.count("secrets.json") == 1);
+
+    // app.env assigns a non-placeholder value to an api_key; settings.js to a token
+    REQUIRE(found.likely_secret.count("app.env") == 1);
+    REQUIRE(found.likely_secret.count(".env") == 0);
+    REQUIRE(found.likely_secret.count("settings.js") == 1);
+    // token.env holds a JWT, caught by the known-format branch
+    REQUIRE(found.likely_secret.count("token.env") == 1);
+    // secrets.json contains only a placeholder value
+    REQUIRE(found.likely_secret.count("secrets.json") == 0);
+
+    fs::remove_all(dir);
+    git_libgit2_shutdown();
+}
+
 TEST_CASE("scan_repo_history handles empty repositories gracefully") {
     REQUIRE(git_libgit2_init() >= 1);
 

@@ -21,6 +21,8 @@ struct UserRepos {
 
     // Fetch a user's repositories via the GitHub REST API.
     // Uses Link-header pagination (the recommended mechanism).
-    // Throws on network errors or a non-2xx/non-404 HTTP response.
+    // Throws on network errors or a non-2xx/non-404 HTTP response; error
+    // messages reuse GitHub's own `message` from the response body and
+    // distinguish rate-limit (403) from credential/scope (403) causes.
     UserRepos get_user_repos(const std::string& username, const std::optional<std::string>& token = std::nullopt, bool include_private = false);
 }
