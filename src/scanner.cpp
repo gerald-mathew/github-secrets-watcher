@@ -31,6 +31,12 @@ namespace scanner {
     static const std::regex env_pattern(R"(\.(env|env\.)|config|settings|secrets)", std::regex::icase);
     static const std::set<std::string> SAFE_EXTENSIONS = {".example", ".template", ".md", ".txt", ".gitignore", ".sample"};
 
+    // Safe accessor for libgit2's last error (giterr_last may return nullptr)
+    static std::string git_error_message() {
+        const git_error* e = giterr_last();
+        return e && e->message ? std::string(e->message) : std::string("unknown libgit2 error");
+    }
+
     std::map<std::string, std::string> scan_repo_history(const std::string& repo_path, int depth) {
         (void)depth; // suppress unused warning - depth is used in the clone step by the caller
         std::map<std::string, std::string> file_to_commit; // file_path -> commit_hash
@@ -43,16 +49,14 @@ namespace scanner {
         // Open the repository
         int error = git_repository_open(&repo, repo_path.c_str());
         if (error < 0) {
-            const git_error* e = giterr_last();
-            throw std::runtime_error("Failed to open repository: " + std::string(e->message));
+            throw std::runtime_error("Failed to open repository: " + git_error_message());
         }
 
         // Create a revision walker
         error = git_revwalk_new(&walk, repo);
         if (error < 0) {
             git_repository_free(repo);
-            const git_error* e = giterr_last();
-            throw std::runtime_error("Failed to create revision walker: " + std::string(e->message));
+            throw std::runtime_error("Failed to create revision walker: " + git_error_message());
         }
 
         // Push HEAD to the walker (we want all commits reachable from HEAD)
@@ -60,8 +64,8 @@ namespace scanner {
         if (error < 0) {
             git_revwalk_free(walk);
             git_repository_free(repo);
-            const git_error* e = giterr_last();
-            throw std::runtime_error("Failed to push HEAD to revision walker: " + std::string(e->message));
+            // Empty/unborn repository (no commits yet) - nothing to scan
+            return {};
         }
 
         // Walk through commits
@@ -97,11 +101,19 @@ namespace scanner {
                 const git_oid* commit_oid = data->second;
 
                 // Get file path
-                std::string file_path = std::string(root) + "/" + git_tree_entry_name(entry);
+                std::string file_path = (root && *root) ? (std::string(root) + "/" + git_tree_entry_name(entry))
+                                                        : std::string(git_tree_entry_name(entry));
 
                 // Use filesystem for path normalization
                 std::filesystem::path path_obj(file_path);
                 std::string normalized_path = path_obj.generic_string();
+
+                // git_tree_walk reports the top-level tree with an empty root;
+                // ensure root-level files never get a leading "/" (that would
+                // produce a broken blob link later).
+                if (!normalized_path.empty() && normalized_path.front() == '/') {
+                    normalized_path.erase(normalized_path.begin());
+                }
 
                 // Directories to exclude (to avoid scanning node_modules, etc.)
                 bool skip = false;
@@ -115,12 +127,8 @@ namespace scanner {
 
                 std::string basename = path_obj.filename().string();
 
-                // Patterns that suggest environment/configuration files
-                const std::regex env_pattern(R"(\.(env|env\.)|config|settings|secrets)", std::regex::icase);
-                // Extensions that are likely safe (templates, documentation, etc.)
-                const std::set<std::string> SAFE_EXTENSIONS = {".example", ".template", ".md", ".txt", ".gitignore", ".sample"};
-
-                // Check if it matches our env pattern
+                // Patterns and safe extensions are file-scope statics - the
+                // regex is compiled exactly once instead of per tree entry.
                 if (!std::regex_search(basename, env_pattern)) {
                     return 0;
                 }
@@ -165,8 +173,7 @@ namespace scanner {
         git_repository_free(repo);
 
         if (error < 0 && error != GIT_ITEROVER) {
-            const git_error* e = giterr_last();
-            throw std::runtime_error("Error walking revisions: " + std::string(e->message));
+            throw std::runtime_error("Error walking revisions: " + git_error_message());
         }
 
         return file_to_commit;

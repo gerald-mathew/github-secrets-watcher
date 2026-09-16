@@ -5,8 +5,23 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <cstdlib>
 
 namespace {
+
+    // RAII guard that initializes libcurl once (thread-safe via function-local
+    // static in C++11+) and cleans up at process exit.
+    struct CurlGlobal {
+        CurlGlobal() {
+            if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+                throw std::runtime_error("Failed to initialize libcurl");
+            }
+        }
+        ~CurlGlobal() {
+            curl_global_cleanup();
+        }
+    };
+
     // Callback for libcurl to write data into a std::string
     size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
         std::string* buffer = static_cast<std::string*>(userdata);
@@ -15,89 +30,128 @@ namespace {
         return total;
     }
 
-    std::string http_get(const std::string& url, const std::optional<std::string>& token) {
+    struct header_collector {
+        std::string rate_limit_remaining;
+        std::string rate_limit_reset;
+        std::string link;
+    };
+
+    // Callback for libcurl to collect response headers
+    size_t header_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+        auto* headers = static_cast<header_collector*>(userdata);
+        size_t total = size * nmemb;
+        std::string line(ptr, total);
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string key = utils::trim(line.substr(0, colon));
+            std::string value = utils::trim(line.substr(colon + 1));
+            if (key == "X-RateLimit-Remaining") headers->rate_limit_remaining = value;
+            else if (key == "X-RateLimit-Reset") headers->rate_limit_reset = value;
+            else if (key == "Link") headers->link += value;
+        }
+        return total;
+    }
+
+    struct HttpResponse {
+        std::string body;
+        long status_code = 0;
+        header_collector headers;
+    };
+
+    // Perform a GET request; returns status + body + selected headers.
+    // Does not validate the status code - the caller decides what to do with it.
+    HttpResponse http_get(const std::string& url, const std::optional<std::string>& token) {
+        CurlGlobal guard; // ensures curl is globally initialized once
+
         CURL* curl = curl_easy_init();
         if (!curl) {
             throw std::runtime_error("Failed to initialize CURL");
         }
-        std::string response;
 
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "github-secrets-watcher/1.0");
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
+        HttpResponse result;
+        struct curl_slist* headers = nullptr;
         if (token.has_value()) {
-            std::string auth = "token " + token.value();
-            struct curl_slist* headers = nullptr;
+            std::string auth = "Authorization: token " + token.value();
             headers = curl_slist_append(headers, auth.c_str());
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         }
 
-        // Optional: set timeout
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &result.headers);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "github-secrets-watcher/1.0");
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             std::string error(curl_easy_strerror(res));
+            curl_slist_free_all(headers); // free header list even on error
             curl_easy_cleanup(curl);
             throw std::runtime_error("CURL request failed: " + error);
         }
 
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status_code);
+        curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
 
-        if (token.has_value()) {
-            // Clean up headers list
-        }
-
-        if (http_code != 200) {
-            throw std::runtime_error("HTTP request failed with code " + std::to_string(http_code));
-        }
-        return response;
+        return result;
     }
 
 } // anonymous namespace
 
 namespace github {
-    std::vector<Repository> get_user_repos(const std::string& username, const std::optional<std::string>& token, bool include_private) {
-        std::vector<Repository> repos;
+    UserRepos get_user_repos(const std::string& username, const std::optional<std::string>& token, bool include_private) {
+        UserRepos result;
         std::string type = include_private && token.has_value() ? "all" : "public";
-        std::string url = "https://api.github.com/users/" + utils::url_encode(username) + "/repos?type=" + type + "&sort=updated&per_page=100";
+        std::string first_url = "https://api.github.com/users/" + utils::url_encode(username) +
+                                "/repos?type=" + type + "&sort=updated&per_page=100";
 
-        int page = 1;
-        while (true) {
-            std::string page_url = url + "&page=" + std::to_string(page);
-            try {
-                std::string response = http_get(page_url, token);
-                nlohmann::json data = nlohmann::json::parse(response);
-                if (!data.is_array()) {
-                    throw std::runtime_error("Expected JSON array");
+        std::string url = first_url;
+        while (!url.empty()) {
+            HttpResponse response = http_get(url, token);
+
+            // Remember rate-limit from the most recent response.
+            if (!response.headers.rate_limit_remaining.empty()) {
+                try {
+                    result.rate_limit_remaining = std::stol(response.headers.rate_limit_remaining);
+                } catch (...) {
+                    result.rate_limit_remaining = -1;
                 }
-                if (data.empty()) {
-                    break; // no more repos
+            }
+
+            if (response.status_code == 404) {
+                throw std::runtime_error("GitHub user not found: " + username);
+            }
+            if (response.status_code != 200) {
+                // Rate limit exceeded or other API error.
+                std::ostringstream msg;
+                msg << "GitHub API returned HTTP " << response.status_code;
+                if (!response.headers.rate_limit_reset.empty()) {
+                    msg << " (rate limit reset at " << response.headers.rate_limit_reset << ")";
                 }
+                throw std::runtime_error(msg.str());
+            }
+
+            nlohmann::json data = nlohmann::json::parse(response.body);
+            if (data.is_array() && !data.empty()) {
                 for (const auto& item : data) {
                     Repository repo;
                     repo.name = item.value("name", "");
                     repo.html_url = item.value("html_url", "");
                     repo.default_branch = item.value("default_branch", "main");
                     if (!repo.name.empty()) {
-                        repos.push_back(repo);
+                        result.repos.push_back(repo);
                     }
                 }
-                // GitHub API returns empty array when no more items
-                if (data.empty()) {
-                    break;
-                }
-                page++;
-            } catch (const std::exception& e) {
-                std::cerr << "Error fetching repos page " << page << ": " << e.what() << std::endl;
-                break;
             }
+
+            // Follow the Link header 'rel="next"' URL when present (GitHub's
+            // recommended pagination mechanism); otherwise stop.
+            url = utils::extract_next_link(response.headers.link).value_or("");
         }
-        return repos;
+        return result;
     }
 } // namespace github

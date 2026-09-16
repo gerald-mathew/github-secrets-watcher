@@ -13,11 +13,13 @@
 #include <sstream>
 #include <atomic>
 #include <algorithm>
+#include <map>
 
 #include "github.hpp"
 #include "scanner.hpp"
 #include "utils.hpp"
 #include "thread_pool.hpp"
+#include "json.hpp"
 #include <git2.h>
 
 // Helper function to get current timestamp for logging
@@ -99,7 +101,7 @@ struct Git2Library {
         int error = git_libgit2_init();
         if (error < 0) {
             const git_error* e = giterr_last();
-            throw std::runtime_error("Failed to initialize libgit2: " + std::string(e->message));
+            throw std::runtime_error("Failed to initialize libgit2: " + std::string(e && e->message ? e->message : "unknown error"));
         }
         initialized_ = true;
     }
@@ -111,38 +113,33 @@ struct Git2Library {
     bool initialized_ = false;
 };
 
-// Function to create a temporary directory for cloning
-std::string create_temp_dir(const std::string& repo_name) {
-    auto now = std::chrono::system_clock::now();
-    auto duration = now.time_since_epoch();
-    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-    fs::path temp_base_path = std::getenv("TEMP") ? fs::path(std::getenv("TEMP")) : fs::path("/tmp");
-    fs::path temp_dir_path = temp_base_path / ("github_secrets_watcher_" + repo_name + "_" + std::to_string(millis));
-
-    // Create directory using filesystem
-    try {
-        fs::create_directories(temp_dir_path);
-    } catch (const fs::filesystem_error& e) {
-        throw std::runtime_error("Failed to create temporary directory: " + temp_dir_path.string() + " - " + e.what());
+// RAII wrapper so temporary clone dirs are always cleaned up, even on exceptions
+class TempDir {
+public:
+    TempDir(const std::string& repo_name) {
+        auto now = std::chrono::system_clock::now();
+        auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        fs::path base = std::getenv("TEMP") ? fs::path(std::getenv("TEMP")) : fs::path("/tmp");
+        path_ = base / ("github_secrets_watcher_" + repo_name + "_" + std::to_string(millis));
+        try {
+            fs::create_directories(path_);
+        } catch (const fs::filesystem_error& e) {
+            throw std::runtime_error("Failed to create temporary directory: " + path_.string() + " - " + e.what());
+        }
     }
-    return temp_dir_path.string();
-}
-
-// Function to remove a directory and its contents
-void remove_dir(const std::string& dir_path) {
-    // Remove directory using filesystem
-    try {
-        fs::remove_all(dir_path);
-        // Ignore errors for cleanup as before
-    } catch (const fs::filesystem_error& e) {
-        // Ignore errors for cleanup as before
-        // Optionally log warning: std::cerr << "Warning: Failed to remove directory " << dir_path << ": " << e.what() << std::endl;
+    ~TempDir() {
+        std::error_code ec;
+        fs::remove_all(path_, ec); // best-effort cleanup
     }
-}
+    const fs::path& path() const { return path_; }
+
+private:
+    fs::path path_;
+};
 
 // Print usage information
 void print_usage(const std::string& prog_name) {
-    std::cout << "Usage: " << prog_name << " scan -u <USERNAME> [-t <TOKEN>] [-d <DEPTH>] [-m <NUM>] [-p] [-n <NUM>] [-f <FMT>] [-o <FILE>] [-v] [-r <REPO>] [-R <REPO1,REPO2,...>]\n\n";
+    std::cout << "Usage: " << prog_name << " scan -u <USERNAME> [-t <TOKEN>] [-d <DEPTH>] [-m <NUM>] [-p] [-n <NUM>] [-f <FMT>] [-o <FILE>] [-v] [-r <REPO>] [-R <REPO1,REPO2,...>] [--dry-run] [-y]\n\n";
     std::cout << "Options:\n";
     std::cout << "  -u, --username <USERNAME>   GitHub username (required)\n";
     std::cout << "  -t, --token <TOKEN>         GitHub personal access token (optional, for private repos and higher rate limits)\n";
@@ -156,6 +153,8 @@ void print_usage(const std::string& prog_name) {
     std::cout << "  -r, --repo <REPO>           Scan only the specified repository\n";
     std::cout << "  -R, --repos <REPO1,REPO2,...>\n";
     std::cout << "                              Scan only the specified repositories (comma-separated list)\n";
+    std::cout << "      --dry-run               List the repositories that would be scanned without scanning\n";
+    std::cout << "  -y, --yes                   Skip the confirmation prompt\n";
 }
 
 // Function to process a single repository (cloning and scanning)
@@ -175,23 +174,17 @@ void process_repository(const Repository& repo, int depth, const std::string& us
         }
     }
 
-    // Create a temporary directory for cloning (read-only)
-    std::string temp_dir = create_temp_dir(repo.name);
+    // Temporary dir cleans itself up through RAII
+    TempDir temp(repo.name);
 
     bool success = true;
     std::string error_message;
     std::vector<FoundFile> files;
 
     try {
-        // Determine clone URL: use token if provided for authentication
-        std::string clone_url;
-        if (token.has_value()) {
-            // Use token for authentication (works for both public and private repos)
-            clone_url = "https://" + token.value() + "@github.com/" + username + "/" + repo.name + ".git";
-        } else {
-            // No token, use public URL
-            clone_url = "https://github.com/" + username + "/" + repo.name + ".git";
-        }
+        // Keep the token out of the clone URL so errors never leak it:
+        // libgit2 calls our credentials callback when the server asks for auth.
+        std::string clone_url = "https://github.com/" + username + "/" + repo.name + ".git";
         if (verbose) {
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "Cloning repository (depth=" << depth << ")..." << std::endl;
@@ -204,40 +197,37 @@ void process_repository(const Repository& repo, int depth, const std::string& us
         // Set depth if specified (shallow clone)
         if (depth > 0) {
             clone_opts.fetch_opts.depth = depth;
-            // localclone is not a member in this version, using default behavior
         }
 
-        // Set up credentials if token is provided
-        git_cred* cred = nullptr;
+        // Set up credentials if token is provided. Each callback call gets a
+        // brand new credential (libgit2 frees the one we return), avoiding
+        // double-frees when the server asks more than once.
         if (token.has_value()) {
-            git_cred_userpass_plaintext_new(&cred, token.value().c_str(), "x-oauth-basic");
-            clone_opts.fetch_opts.callbacks.credentials = [](git_cred** out, const char* url, const char* username_from_url, unsigned int allowed_types, void* payload) -> int {
+            const std::string app_password = "x-oauth-basic";
+            struct auth_payload { const std::string* token; const std::string* password; };
+            auth_payload payload{ &token.value(), &app_password };
+            clone_opts.fetch_opts.callbacks.credentials = [](git_credential** out, const char* url, const char* username_from_url, unsigned int allowed_types, void* cb_payload) -> int {
                 (void)url;
                 (void)username_from_url;
                 (void)allowed_types;
-                git_cred* cred = *static_cast<git_cred**>(payload);
-                *out = cred;
-                return 0;
+                auto* auth = static_cast<auth_payload*>(cb_payload);
+                return git_credential_userpass_plaintext_new(out, auth->token->c_str(), auth->password->c_str());
             };
-            clone_opts.fetch_opts.callbacks.payload = &cred;
+            clone_opts.fetch_opts.callbacks.payload = &payload;
         }
 
         // Perform the clone
         git_repository* cloned_repo = nullptr;
-        int error = git_clone(&cloned_repo, clone_url.c_str(), temp_dir.c_str(), &clone_opts);
-
-        // Cleanup credentials
-        if (cred) {
-            git_cred_free(cred);
-        }
+        int error = git_clone(&cloned_repo, clone_url.c_str(), temp.path().string().c_str(), &clone_opts);
 
         if (error < 0) {
             const git_error* e = giterr_last();
+            std::string msg = e && e->message ? std::string(e->message) : "unknown libgit2 error";
             if (verbose) {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
-                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "[" << get_timestamp() << "] Git clone failed: " << std::string(e->message) << std::endl;
+                std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "[" << get_timestamp() << "] Git clone failed: " << msg << std::endl;
             }
-            throw std::runtime_error("Git clone failed: " + std::string(e->message));
+            throw std::runtime_error("Git clone failed: " + msg);
         }
 
         // Cleanup cloned repository handle (we don't need to keep it open)
@@ -250,7 +240,7 @@ void process_repository(const Repository& repo, int depth, const std::string& us
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "[" << get_timestamp() << "] Scanning history..." << std::endl;
         }
-        std::map<std::string, std::string> file_to_commit = scanner::scan_repo_history(temp_dir, depth);
+        std::map<std::string, std::string> file_to_commit = scanner::scan_repo_history(temp.path().string(), depth);
 
         if (!file_to_commit.empty()) {
             if (verbose) {
@@ -305,9 +295,6 @@ void process_repository(const Repository& repo, int depth, const std::string& us
         }
     }
 
-    // Clean up temporary directory
-    remove_dir(temp_dir);
-
     // Add the result to the global results
     {
         std::lock_guard<std::mutex> lock(g_results_mutex);
@@ -320,55 +307,40 @@ void output_results(bool verbose) {
     std::lock_guard<std::mutex> lock(g_output_mutex);
     switch (g_output_format) {
         case OutputFormat::JSON: {
-            *g_output_stream << "[\n";
-            for (size_t i = 0; i < g_results.size(); ++i) {
-                const auto& r = g_results[i];
-                *g_output_stream << "  {\n";
-                *g_output_stream << "    \"repo_name\": \"" << r.repo_name << "\",\n";
-                *g_output_stream << "    \"html_url\": \"" << r.html_url << "\",\n";
-                *g_output_stream << "    \"success\": " << (r.success ? "true" : "false") << ",\n";
+            // nlohmann::json handles all string escaping correctly
+            nlohmann::json out = nlohmann::json::array();
+            for (const auto& r : g_results) {
+                nlohmann::json entry;
+                entry["repo_name"] = r.repo_name;
+                entry["html_url"] = r.html_url;
+                entry["success"] = r.success;
                 if (!r.error_message.empty()) {
-                    *g_output_stream << "    \"error_message\": \"" << r.error_message << "\",\n";
+                    entry["error_message"] = r.error_message;
                 }
-                *g_output_stream << "    \"files\": [\n";
-                for (size_t j = 0; j < r.files.size(); ++j) {
-                    const auto& f = r.files[j];
-                    *g_output_stream << "      {\n";
-                    *g_output_stream << "        \"path\": \"" << f.path << "\",\n";
-                    *g_output_stream << "        \"commit_hash\": \"" << f.commit_hash << "\"\n";
-                    *g_output_stream << "      }";
-                    if (j != r.files.size() - 1) {
-                        *g_output_stream << ",";
-                    }
-                    *g_output_stream << "\n";
+                nlohmann::json files = nlohmann::json::array();
+                for (const auto& f : r.files) {
+                    files.push_back({{"path", f.path}, {"commit_hash", f.commit_hash}});
                 }
-                *g_output_stream << "    ]\n";
-                *g_output_stream << "  }";
-                if (i != g_results.size() - 1) {
-                    *g_output_stream << ",";
-                }
-                *g_output_stream << "\n";
+                entry["files"] = files;
+                out.push_back(entry);
             }
-            *g_output_stream << "]\n";
+            *g_output_stream << out.dump(2) << "\n";
             break;
         }
         case OutputFormat::CSV: {
+            // RFC 4180: fields containing , " or newlines are quoted and
+            // embedded quotes are doubled
+            auto field = [](const std::string& s) { return utils::csv_escape(s); };
             *g_output_stream << "repo_name,success,error_message,file_path,commit_hash\n";
             for (const auto& r : g_results) {
                 if (r.files.empty()) {
-                    *g_output_stream << r.repo_name << "," << (r.success ? "true" : "false") << ",";
-                    if (!r.error_message.empty()) {
-                        *g_output_stream << "\"" << r.error_message << "\"";
-                    }
-                    *g_output_stream << ",,\n";
+                    *g_output_stream << field(r.repo_name) << "," << (r.success ? "true" : "false") << ","
+                                     << field(r.error_message) << ",,\n";
                 } else {
-                    for (size_t j = 0; j < r.files.size(); ++j) {
-                        const auto& f = r.files[j];
-                        *g_output_stream << r.repo_name << "," << (r.success ? "true" : "false") << ",";
-                        if (!r.error_message.empty()) {
-                            *g_output_stream << "\"" << r.error_message << "\"";
-                        }
-                        *g_output_stream << "," << f.path << "," << f.commit_hash << "\n";
+                    for (const auto& f : r.files) {
+                        *g_output_stream << field(r.repo_name) << "," << (r.success ? "true" : "false") << ","
+                                         << field(r.error_message) << "," << field(f.path) << ","
+                                         << field(f.commit_hash) << "\n";
                     }
                 }
             }
@@ -447,6 +419,8 @@ int main(int argc, char* argv[]) {
     std::optional<int> max_repos = std::nullopt;
     bool include_private = false;
     bool verbose = false;
+    bool dry_run = false;
+    bool assume_yes = false;
     int thread_count = static_cast<int>(std::thread::hardware_concurrency());
     if (thread_count <= 0) thread_count = 4; // fallback
     OutputFormat format = OutputFormat::Text;
@@ -570,6 +544,10 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             selected_repos_list = repos_list;
+        } else if (arg == "--dry-run") {
+            dry_run = true;
+        } else if (arg == "--yes" || arg == "-y") {
+            assume_yes = true;
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
             print_usage(argv[0]);
@@ -594,19 +572,23 @@ int main(int argc, char* argv[]) {
     std::cout << "         Only scan repositories you own or have permission to scan.\n";
     std::cout << "         This tool performs read-only operations and does not modify any repositories.\n\n";
 
-    std::cout << "Do you want to continue? (y/N): ";
-    std::string response;
-    std::getline(std::cin, response);
-    std::transform(response.begin(), response.end(), response.begin(), ::tolower);
-    if (response != "y" && response != "yes") {
-        std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scan cancelled.\n";
-        return 0;
+    // Confirmation prompt is skipped with --dry-run and --yes
+    if (!dry_run && !assume_yes) {
+        std::cout << "Do you want to continue? (y/N): ";
+        std::string response;
+        std::getline(std::cin, response);
+        std::transform(response.begin(), response.end(), response.begin(), ::tolower);
+        if (response != "y" && response != "yes") {
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scan cancelled.\n";
+            return 0;
+        }
     }
 
     // Set global output format and stream
     g_output_format = format;
+    std::ofstream* ofs = nullptr;
     if (!output_file.empty()) {
-        std::ofstream* ofs = new std::ofstream(output_file);
+        ofs = new std::ofstream(output_file);
         if (!ofs->is_open()) {
             std::cerr << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "Failed to open output file: " << output_file << "\n";
             return 1;
@@ -623,11 +605,19 @@ int main(int argc, char* argv[]) {
         std::cout << "\n";
 
         // Get list of repositories
-        std::vector<Repository> repos = github::get_user_repos(username, token, include_private);
-        if (repos.empty()) {
+        github::UserRepos user_repos = github::get_user_repos(username, token, include_private);
+        if (user_repos.repos.empty()) {
             std::cout << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "No repositories found or error occurred.\n";
             return 0;
         }
+
+        // Warn when the API rate limit is about to run out
+        if (user_repos.rate_limit_remaining >= 0 && user_repos.rate_limit_remaining <= 10) {
+            std::cerr << COLOR_WARN << "[WARN] " << COLOR_RESET << "GitHub API rate limit is low: "
+                      << user_repos.rate_limit_remaining << " requests remaining. Use --token to raise it.\n";
+        }
+
+        std::vector<Repository> repos = user_repos.repos;
 
         if (max_repos.has_value()) {
             if (static_cast<int>(repos.size()) > max_repos.value()) {
@@ -678,6 +668,16 @@ int main(int argc, char* argv[]) {
         if (max_repos.has_value() && static_cast<int>(filtered_repos.size()) > max_repos.value()) {
             filtered_repos.resize(max_repos.value());
             std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Limited to " << max_repos.value() << " repositories.\n\n";
+        }
+
+        // Dry run just lists what would be scanned, no cloning happens
+        if (dry_run) {
+            std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Dry run: " << filtered_repos.size() << " repositories would be scanned:\n";
+            for (const auto& repo : filtered_repos) {
+                std::cout << "  - " << repo.name << " (" << repo.html_url << ")\n";
+            }
+            delete ofs;
+            return 0;
         }
 
         // Process each repository using thread pool

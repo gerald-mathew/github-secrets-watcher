@@ -53,4 +53,39 @@ namespace utils {
         if (start == std::string::npos) return "";
         return str.substr(start, end - start + 1);
     }
+
+    std::string csv_escape(const std::string& value) {
+        bool needs_quotes = value.find_first_of(",\"\n\r") != std::string::npos;
+        if (!needs_quotes) return value;
+        std::string escaped;
+        escaped.reserve(value.size() + 2);
+        escaped += '"';
+        for (char c : value) {
+            if (c == '"') escaped += '"';
+            escaped += c;
+        }
+        escaped += '"';
+        return escaped;
+    }
+
+    std::optional<std::string> extract_next_link(const std::string& link_header) {
+        if (link_header.empty()) return std::nullopt;
+        // GitHub sends: <https://...>; rel="next", <https://...>; rel="last"
+        for (const auto& raw_part : utils::split(link_header, ',')) {
+            const std::string part = utils::trim(raw_part);
+            size_t angle_open = part.find('<');
+            size_t angle_close = part.find('>');
+            if (angle_open == std::string::npos || angle_close == std::string::npos ||
+                angle_close <= angle_open) {
+                continue;
+            }
+            std::string url = part.substr(angle_open + 1, angle_close - angle_open - 1);
+            if (part.find("rel=\"next\"") != std::string::npos ||
+                part.find("rel='next'") != std::string::npos ||
+                part.find("rel=next") != std::string::npos) {
+                return url;
+            }
+        }
+        return std::nullopt;
+    }
 }
