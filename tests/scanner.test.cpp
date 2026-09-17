@@ -2,6 +2,7 @@
 #include <git2.h>
 #include <fstream>
 #include <chrono>
+#include <thread>
 #include <stdexcept>
 #include <filesystem>
 
@@ -91,6 +92,22 @@ void remove_file(const fs::path& base, const std::string& name) {
     REQUIRE(fs::remove(base / name));
 }
 
+// Delete a temp repository. libgit2 keeps a repository's object files open
+// until its global state is released, so the library must be shut down before
+// the directory is removed; Windows fails the delete otherwise. The retry
+// absorbs any lag between shutdown and the OS closing the last handle.
+void cleanup_temp_repo(const fs::path& dir) {
+    git_libgit2_shutdown();
+    std::error_code ec;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        ec.clear();
+        fs::remove_all(dir, ec);
+        if (!ec) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE_FALSE(ec);
+}
+
 } // anonymous namespace
 
 TEST_CASE("scan_repo_history finds committed env files and skips the rest") {
@@ -127,8 +144,7 @@ TEST_CASE("scan_repo_history finds committed env files and skips the rest") {
     // reported hashes must be valid git object ids
     REQUIRE(utils::is_valid_commit_hash(map.at("settings.json")));
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("scan_repo_history ignores build, media, and doc files that cannot be secrets") {
@@ -153,8 +169,7 @@ TEST_CASE("scan_repo_history ignores build, media, and doc files that cannot be 
 
     REQUIRE(map.empty());
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("scan_repo_history ignores .env.schema files (penv-style schema files)") {
@@ -175,8 +190,7 @@ TEST_CASE("scan_repo_history ignores .env.schema files (penv-style schema files)
     REQUIRE(found.file_to_commit.count("appsettings.schema.json") == 0);
     REQUIRE(found.file_to_commit.count(".env") == 1);
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("scan_repo_history content-probes files and ranks likely-secrets") {
@@ -211,8 +225,7 @@ TEST_CASE("scan_repo_history content-probes files and ranks likely-secrets") {
     // secrets.json contains only a placeholder value
     REQUIRE(found.likely_secret.count("secrets.json") == 0);
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("scan_repo_history handles empty repositories gracefully") {
@@ -225,8 +238,7 @@ TEST_CASE("scan_repo_history handles empty repositories gracefully") {
     auto found = scanner::scan_repo_history(dir.string(), 0, 0);
     REQUIRE(found.file_to_commit.empty());
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("deleted env files point at the newest commit that contained them") {
@@ -253,8 +265,7 @@ TEST_CASE("deleted env files point at the newest commit that contained them") {
     // app.config.yml still exists at the tip (c2).
     REQUIRE(map.at("app.config.yml") == c2);
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("a file still present at the tip is attributed to the tip commit") {
@@ -278,8 +289,7 @@ TEST_CASE("a file still present at the tip is attributed to the tip commit") {
     REQUIRE(map.at(".env") == c3);
     REQUIRE(map.at("server.env") == c3);
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("early_exit stops after the configured number of quiet commits") {
@@ -315,8 +325,7 @@ TEST_CASE("early_exit stops after the configured number of quiet commits") {
     REQUIRE_FALSE(full.stopped_early);
     REQUIRE(full.commits_considered == 5);
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("depth truncation is reported and the walk is bounded") {
@@ -341,8 +350,7 @@ TEST_CASE("depth truncation is reported and the walk is bounded") {
     REQUIRE(found.file_to_commit.count(".env") == 1);
     REQUIRE(found.file_to_commit.count(".env.old") == 0);
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
 
 TEST_CASE("commits with an identical tree are skipped, not diffed") {
@@ -361,6 +369,5 @@ TEST_CASE("commits with an identical tree are skipped, not diffed") {
     auto found = scanner::scan_repo_history(dir.string(), 0, 0);
     REQUIRE(found.commits_skipped >= 1);
 
-    fs::remove_all(dir);
-    git_libgit2_shutdown();
+    cleanup_temp_repo(dir);
 }
