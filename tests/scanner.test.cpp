@@ -92,14 +92,23 @@ void remove_file(const fs::path& base, const std::string& name) {
     REQUIRE(fs::remove(base / name));
 }
 
-// Delete a temp repository. libgit2 keeps a repository's object files open
-// until its global state is released, so the library must be shut down before
-// the directory is removed; Windows fails the delete otherwise. The retry
-// absorbs any lag between shutdown and the OS closing the last handle.
+// Delete a temp repository. libgit2 writes loose objects read-only (mode
+// 0444, matching git), and Windows refuses to delete a read-only file. Clear
+// the write protection on every entry first, and shut libgit2 down so no
+// object files are still mapped. The retry absorbs any remaining OS lag.
 void cleanup_temp_repo(const fs::path& dir) {
     git_libgit2_shutdown();
     std::error_code ec;
-    for (int attempt = 0; attempt < 20; ++attempt) {
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        for (auto it = fs::recursive_directory_iterator(
+                 dir, fs::directory_options::skip_permission_denied, ec);
+             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            std::error_code ignored;
+            fs::permissions(it->path(),
+                            fs::perms::owner_write | fs::perms::group_write |
+                                fs::perms::others_write,
+                            fs::perm_options::add, ignored);
+        }
         ec.clear();
         fs::remove_all(dir, ec);
         if (!ec) return;
@@ -147,7 +156,7 @@ TEST_CASE("scan_repo_history finds committed env files and skips the rest") {
     cleanup_temp_repo(dir);
 }
 
-TEST_CASE("scan_repo_history ignores build, media, and doc files that cannot be secrets") {
+TEST_CASE("scan_repo_history ignores build, media, doc, and editor files that cannot be secrets") {
     REQUIRE(git_libgit2_init() >= 1);
 
     git_repository* repo = nullptr;
@@ -160,6 +169,10 @@ TEST_CASE("scan_repo_history ignores build, media, and doc files that cannot be 
     write_file(dir, "settings.svg", "x\n");
     write_file(dir, "config.pdf", "x\n");
     write_file(dir, "secrets.md", "x\n");
+    // editor/IDE state must not be flagged as project configuration
+    write_file(dir, ".vscode/settings.json", "{\n  \"editor.formatOnSave\": true\n}\n");
+    write_file(dir, ".vscode/.env", "SECRET=x\n");
+    write_file(dir, ".idea/settings.json", "{}\n");
 
     make_commit(repo, "test@example.com", "initial commit");
     git_repository_free(repo);

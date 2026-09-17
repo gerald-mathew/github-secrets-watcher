@@ -1,0 +1,5 @@
+# Windows batch files must keep CRLF line endings: cmd.exe mis-parses
+# LF-only files (labels, `call :label` targets, parenthesised blocks).
+*.bat text eol=crlf
+# Shell scripts must keep LF line endings.
+*.sh text eol=lf

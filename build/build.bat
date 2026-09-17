@@ -43,13 +43,15 @@ REM --------------------------------------------------------------
 if defined CMAKE (
     echo [INFO] Found CMake: configuring, building and testing with it.
     echo [INFO] Configure...
-    "!CMAKE!" -S ".." -B "build" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+    REM Build in this script's own directory so build.bat and build.sh share
+    REM a single build tree (the twin behaviour the CI relies on too).
+    "!CMAKE!" -S ".." -B "." -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
     if errorlevel 1 (
         echo [ERROR] CMake configure failed.
         exit /b 1
     )
     echo [INFO] Build...
-    "!CMAKE!" --build build --parallel
+    "!CMAKE!" --build . --parallel
     if errorlevel 1 (
         echo [ERROR] CMake build failed.
         exit /b 1
@@ -58,11 +60,15 @@ if defined CMAKE (
     call :find_tool ctest
     if defined TOOL_FOUND set "CTEST=!TOOL_FOUND!"
     if defined CTEST (
-        "!CTEST!" --test-dir build --output-on-failure
+        "!CTEST!" --test-dir . --output-on-failure
+        if errorlevel 1 (
+            echo [ERROR] Tests failed.
+            exit /b 1
+        )
     ) else (
         echo [WARN] ctest not found; built successfully but tests not run.
     )
-    echo Build successful! Executable: build\github_secrets_watcher.exe
+    echo Build successful! Executable: %~dp0github_secrets_watcher.exe
     exit /b 0
 )
 
