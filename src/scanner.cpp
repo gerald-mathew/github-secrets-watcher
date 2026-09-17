@@ -15,7 +15,9 @@ namespace scanner {
     static const std::set<std::string> EXCLUDED_DIRS = {
         "node_modules", ".git", "__pycache__", "dist", "build", "coverage",
         ".next", ".nuxt", "vendor", "bower_components", ".svelte-kit",
-        ".cache", ".parcel", ".webpack", ".turbo", ".expo", "android", "ios"
+        ".cache", ".parcel", ".webpack", ".turbo", ".expo", "android", "ios",
+        // editor / IDE state - local tooling, never deployed runtime secrets
+        ".vscode", ".vscode-test", ".idea", ".vs", ".fleet", ".zed", ".history"
     };
 
     // Case-insensitive substring search. This is the hot path of the scanner
