@@ -22,10 +22,13 @@
 #include "json.hpp"
 #include <git2.h>
 
-// Helper function to get current timestamp for logging
+// Helper function to get current timestamp for logging (millisecond precision,
+// so the verbose log can be used to see where a scan spends its time).
 std::string get_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now.time_since_epoch()) % 1000;
     std::tm tm{};
 #ifdef _WIN32
     localtime_s(&tm, &time_t); // Windows
@@ -34,7 +37,30 @@ std::string get_timestamp() {
 #endif
 
     std::ostringstream oss;
-    oss << std::put_time(&tm, "%H:%M:%S");
+    oss << std::put_time(&tm, "%H:%M:%S") << '.'
+        << std::setfill('0') << std::setw(3) << ms.count();
+    return oss.str();
+}
+
+// Monotonic clock used for the per-phase durations. Unlike the wall-clock
+// timestamp above it never jumps, so it is safe to subtract.
+using SteadyClock = std::chrono::steady_clock;
+
+long long elapsed_us(SteadyClock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               SteadyClock::now() - start).count();
+}
+
+// Render a microsecond duration as a short human-readable string.
+std::string format_duration(long long us) {
+    std::ostringstream oss;
+    if (us < 1000) {
+        oss << us << " us";
+    } else if (us < 1000000) {
+        oss << std::fixed << std::setprecision(1) << (us / 1000.0) << " ms";
+    } else {
+        oss << std::fixed << std::setprecision(2) << (us / 1000000.0) << " s";
+    }
     return oss.str();
 }
 
@@ -65,6 +91,11 @@ struct RepoResult {
     size_t commits_skipped = 0;
     bool stopped_early = false;
     bool truncated_by_depth = false;
+    // Wall-time spent on the two phases of this repository. Precisely the
+    // phases users care about: the network-bound "get a local copy" phase and
+    // the CPU-bound "walk the history" phase.
+    long long prepare_us = 0;
+    long long scan_us = 0;
 };
 
 // Files copied out of ScanResult to build the per-repo report
@@ -74,6 +105,8 @@ struct RepoFindings {
     size_t commits_skipped = 0;
     bool stopped_early = false;
     bool truncated_by_depth = false;
+    long long prepare_us = 0;
+    long long scan_us = 0;
 };
 
 // Global variables for output configuration
@@ -134,7 +167,7 @@ public:
     TempDir(const std::string& repo_name) {
         auto now = std::chrono::system_clock::now();
         auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-        fs::path base = std::getenv("TEMP") ? fs::path(std::getenv("TEMP")) : fs::path("/tmp");
+        fs::path base = std::getenv("TEMP") ? fs::path(std::getenv("TEMP")) : fs::temp_directory_path();
         path_ = base / ("github_secrets_watcher_" + repo_name + "_" + std::to_string(millis));
         try {
             fs::create_directories(path_);
@@ -295,6 +328,8 @@ void process_repository(const Repository& repo, int depth, size_t early_exit,
     AuthToken auth;
     const bool caching = use_cache && (depth <= 0);
 
+    const SteadyClock::time_point phase_start = SteadyClock::now();
+
     try {
         // Keep the token out of the clone/fetch URL so errors never leak it:
         // libgit2 calls our credentials callback when the server asks for auth.
@@ -366,11 +401,20 @@ void process_repository(const Repository& repo, int depth, size_t early_exit,
         }
 
         // Scan history for env-like files
+        findings.prepare_us = elapsed_us(phase_start);
+        if (verbose) {
+            std::lock_guard<std::mutex> lock(g_console_mutex);
+            std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "[" << get_timestamp()
+                      << "] Ready to scan (" << (caching ? "cache" : "fresh clone")
+                      << ") in " << format_duration(findings.prepare_us) << std::endl;
+        }
+        const SteadyClock::time_point scan_start = SteadyClock::now();
         if (verbose) {
             std::lock_guard<std::mutex> lock(g_console_mutex);
             std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET << "[" << get_timestamp() << "] Scanning history..." << std::endl;
         }
         scanner::ScanResult scan = scanner::scan_repo_history(scan_path, depth, early_exit);
+        findings.scan_us = elapsed_us(scan_start);
 
         findings.commits_considered = scan.commits_considered;
         findings.commits_skipped = scan.commits_skipped;
@@ -460,7 +504,8 @@ void process_repository(const Repository& repo, int depth, size_t early_exit,
         std::lock_guard<std::mutex> lock(g_results_mutex);
         g_results.push_back({repo.name, repo.html_url, success, error_message, findings.files, index,
                              findings.commits_considered, findings.commits_skipped,
-                             findings.stopped_early, findings.truncated_by_depth});
+                             findings.stopped_early, findings.truncated_by_depth,
+                             findings.prepare_us, findings.scan_us});
     }
 }
 
@@ -547,6 +592,10 @@ void output_results(bool verbose) {
                         std::string file_url = repo_url + "/blob/" + f.commit_hash + "/" + encoded_file_path;
                         *g_output_stream << "      [LINK] " << file_url << "\n";
                     }
+                }
+                if (verbose) {
+                    *g_output_stream << "  Timing: clone/fetch " << format_duration(r.prepare_us)
+                                     << ", history scan " << format_duration(r.scan_us) << "\n";
                 }
                 *g_output_stream << "\n";
             }
@@ -802,6 +851,7 @@ int main(int argc, char* argv[]) {
     }
 
     try {
+        const SteadyClock::time_point t0 = SteadyClock::now();
         std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scanning " << (include_private ? "public and private" : "public")
                   << " repositories for user: " << username << "\n";
         if (depth <= 0) {
@@ -824,6 +874,7 @@ int main(int argc, char* argv[]) {
 
         // Get list of repositories
         github::UserRepos user_repos = github::get_user_repos(username, token, include_private);
+        const long long api_us = elapsed_us(t0);
         if (user_repos.repos.empty()) {
             std::cout << COLOR_FAIL << "[FAIL] " << COLOR_RESET << "No repositories found or error occurred.\n";
             return 0;
@@ -917,6 +968,32 @@ int main(int argc, char* argv[]) {
         // After all threads are done, move to next line for progress indicator
         if (!verbose) {
             std::cerr << std::endl;
+        }
+
+        // Verbose timing summary: where did the time actually go?
+        if (verbose) {
+            long long prepare_total = 0, scan_total = 0;
+            long long max_prepare = 0, max_scan = 0;
+            const RepoResult* slow_prepare = nullptr;
+            const RepoResult* slow_scan = nullptr;
+            for (const auto& r : g_results) {
+                prepare_total += r.prepare_us;
+                scan_total += r.scan_us;
+                if (r.prepare_us > max_prepare) { max_prepare = r.prepare_us; slow_prepare = &r; }
+                if (r.scan_us > max_scan) { max_scan = r.scan_us; slow_scan = &r; }
+            }
+            std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET
+                      << "Timing: GitHub API " << format_duration(api_us)
+                      << " | clone/fetch total " << format_duration(prepare_total)
+                      << " | history scan total " << format_duration(scan_total)
+                      << " | wall " << format_duration(elapsed_us(t0)) << "\n";
+            if (slow_prepare) {
+                std::cerr << COLOR_INFO << "[INFO] " << COLOR_RESET
+                          << "Timing: slowest clone/fetch " << slow_prepare->repo_name
+                          << " (" << format_duration(max_prepare) << "), slowest history scan "
+                          << (slow_scan ? slow_scan->repo_name : "?") << " ("
+                          << format_duration(max_scan) << ")\n";
+            }
         }
 
         std::cout << COLOR_INFO << "[INFO] " << COLOR_RESET << "Scan complete!\n";

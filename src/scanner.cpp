@@ -4,6 +4,7 @@
 #include <regex>
 #include <set>
 #include <string_view>
+#include <cctype>
 #include <filesystem>
 #include <git2.h>
 
@@ -17,7 +18,32 @@ namespace scanner {
         ".cache", ".parcel", ".webpack", ".turbo", ".expo", "android", "ios"
     };
 
-    static const std::regex env_pattern(R"(\.(env|env\.)|config|settings|secrets)", std::regex::icase);
+    // Case-insensitive substring search. This is the hot path of the scanner
+    // (it runs once per changed path per commit plus once per tip tree entry),
+    // so it must not allocate or use std::regex.
+    static bool contains_ci(std::string_view haystack, std::string_view needle) {
+        if (needle.empty()) return true;
+        if (haystack.size() < needle.size()) return false;
+        const auto to_lower = [](char c) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        };
+        const size_t max_i = haystack.size() - needle.size();
+        for (size_t i = 0; i <= max_i; ++i) {
+            size_t j = 0;
+            while (j < needle.size() && to_lower(haystack[i + j]) == needle[j]) ++j;
+            if (j == needle.size()) return true;
+        }
+        return false;
+    }
+
+    // Equivalent to the old regex \.(env|env\.)|config|settings|secrets
+    // (case-insensitive). ".env" also matches the ".env." variant.
+    static bool name_looks_interesting(const std::string& basename) {
+        return contains_ci(basename, ".env") ||
+               contains_ci(basename, "config") ||
+               contains_ci(basename, "settings") ||
+               contains_ci(basename, "secrets");
+    }
     // Files that cannot be potential secrets even when their name contains
     // "env/config/settings/secrets": documentation, machine-generated build
     // artifacts, source maps, media, and fonts.
@@ -63,7 +89,7 @@ namespace scanner {
         }
 
         std::string basename = path_obj.filename().string();
-        if (!std::regex_search(basename, env_pattern)) {
+        if (!name_looks_interesting(basename)) {
             return false;
         }
         if (is_test_file(basename)) {
@@ -135,11 +161,61 @@ namespace scanner {
         return secret;
     }
 
-    struct SeedContext {
-        ScanResult* result;
-        const std::string* tip_hash;
-        git_repository* repo;
-    };
+    // Record one interesting entry found in the newest tip. Files present in
+    // the tip are at their most recent known commit.
+    static void seed_entry(git_repository* repo, const git_tree_entry* entry,
+                           const std::string& prefix, const std::string& tip_hash,
+                           ScanResult* result) {
+        const std::string file_path = prefix.empty()
+            ? std::string(git_tree_entry_name(entry))
+            : prefix + "/" + std::string(git_tree_entry_name(entry));
+        if (!looks_interesting(file_path)) return;
+        result->file_to_commit[file_path] = tip_hash;
+        if (git_tree_entry_filemode(entry) != GIT_FILEMODE_TREE &&
+            blob_looks_secret(repo, git_tree_entry_id(entry))) {
+            result->likely_secret[file_path] = true;
+        }
+    }
+
+    // Recursive tip-tree walk that prunes EXCLUDED_DIRS. The previous
+    // git_tree_walk visited every directory (including node_modules, build,
+    // vendor, ...), making the seed phase O(whole tree) even though excluded
+    // subtrees can never contribute findings. These directories are already
+    // filtered out of the results, so skipping them here changes nothing but
+    // the time it takes.
+    static void walk_pruned_seed(git_repository* repo, git_tree* tree,
+                                 const std::string& prefix, const std::string& tip_hash,
+                                 ScanResult* result) {
+        const size_t count = git_tree_entrycount(tree);
+        for (size_t i = 0; i < count; ++i) {
+            const git_tree_entry* entry = git_tree_entry_byindex(tree, i);
+            if (git_tree_entry_filemode(entry) == GIT_FILEMODE_TREE) {
+                const char* name = git_tree_entry_name(entry);
+                if (name && EXCLUDED_DIRS.find(name) != EXCLUDED_DIRS.end()) {
+                    continue;
+                }
+                // Match the previous behavior for directory entries: a
+                // directory whose name matches (e.g. "config", "settings")
+                // is flagged at the tip, just like a file. The git_tree_walk
+                // used to visit every entry including directories and the
+                // blob probe was skipped for tree entries - mirror that here.
+                const std::string dir_path =
+                    prefix.empty() ? std::string(name) : prefix + "/" + name;
+                if (looks_interesting(dir_path)) {
+                    result->file_to_commit[dir_path] = tip_hash;
+                }
+                git_tree* sub = nullptr;
+                if (git_tree_lookup(&sub, repo, git_tree_entry_id(entry)) == 0) {
+                    const std::string child_prefix =
+                        prefix.empty() ? std::string(name) : prefix + "/" + name;
+                    walk_pruned_seed(repo, sub, child_prefix, tip_hash, result);
+                    git_tree_free(sub);
+                }
+            } else {
+                seed_entry(repo, entry, prefix, tip_hash, result);
+            }
+        }
+    }
 
     struct DeltaContext {
         ScanResult* result;
@@ -147,31 +223,6 @@ namespace scanner {
         const std::string* deleted_hash;
         git_repository* repo;
     };
-
-    // Tree-walk callback used once to seed the result from the newest tip: a
-    // file that still exists there is at its most recent known commit.
-    static int seed_tree_cb(const char* root, const git_tree_entry* entry, void* payload) {
-        auto* ctx = static_cast<SeedContext*>(payload);
-
-        std::string file_path = (root && *root) ? (std::string(root) + "/" + git_tree_entry_name(entry))
-                                                : std::string(git_tree_entry_name(entry));
-        std::filesystem::path path_obj(file_path);
-        std::string normalized_path = path_obj.generic_string();
-        // git_tree_walk reports the top-level tree with an empty root; ensure
-        // root-level files never get a leading "/".
-        if (!normalized_path.empty() && normalized_path.front() == '/') {
-            normalized_path.erase(normalized_path.begin());
-        }
-
-        if (looks_interesting(normalized_path)) {
-            ctx->result->file_to_commit[normalized_path] = *ctx->tip_hash;
-            if (git_tree_entry_filemode(entry) != GIT_FILEMODE_TREE &&
-                blob_looks_secret(ctx->repo, git_tree_entry_id(entry))) {
-                ctx->result->likely_secret[normalized_path] = true;
-            }
-        }
-        return 0;
-    }
 
     // Diff iteration callback. After the tip is seeded, new findings can only
     // come from files that were removed again (their newest existing commit is
@@ -292,9 +343,9 @@ namespace scanner {
                 // First commit processed (a tip): files present here still
                 // exist, so this is their most recent known commit. The tip is
                 // also often the commit that deleted an older file, so its diff
-                // is still examined below.
-                SeedContext ctx{&result, &current_hash, repo};
-                git_tree_walk(tree, GIT_TREEWALK_PRE, seed_tree_cb, &ctx);
+                // is still examined below. Excluded directories are pruned so
+                // the walk stays proportional to the relevant file count.
+                walk_pruned_seed(repo, tree, "", current_hash, &result);
                 seeded = true;
             }
 
