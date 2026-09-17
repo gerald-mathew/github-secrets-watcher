@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="220" viewBox="0 0 1000 220" role="img" aria-label="github-secrets-watcher banner">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#11192a"/>
+      <stop offset="1" stop-color="#06111f"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#0284c7"/>
+    </linearGradient>
+  </defs>
+  <rect width="1000" height="220" rx="26" fill="url(#bg)"/>
+  <g transform="translate(96 52)">
+    <path d="M0 22 L52 0 L104 22 L104 96 C104 148 62 172 52 178 C42 172 0 148 0 96 Z"
+          fill="url(#shield)" opacity="0.96"/>
+    <circle cx="52" cy="88" r="34" fill="none" stroke="#0f172a" stroke-width="3" opacity="0.5"/>
+    <g stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.9">
+      <path d="M52 88 L78 62"/>
+    </g>
+    <circle cx="52" cy="88" r="5" fill="#ffffff"/>
+  </g>
+  <text x="242" y="112" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" font-size="48" fill="#ffffff">github-secrets-watcher</text>
+  <text x="246" y="152" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#7dd3fc">audit git history for committed env / config / secret files</text>
+  <text x="246" y="184" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#64748b">C++20 · libcurl · libgit2 · read-only · text / json / csv</text>
+</svg>
