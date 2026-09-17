@@ -1,103 +1,135 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
+title github-secrets-watcher build
 echo Building github-secrets-watcher...
 cd /d "%~dp0"
 set "SRC_DIR=..\src"
 
-REM Enhanced search directories for libraries
-set "SEARCH_DIRS=C:\msys64\mingw64 C:\msys64\usr\local C:\ C:\msys64 C:\msys64\ucrt64 C:\msys64\mingw64 C:\Program Files C:\Program Files (x86) C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC C:\DevKit\mingw64 C:\DevKit\mingw32 C:\tools\msys64 C:\tools\msys64\mingw64 C:\tools\msys64\mingw32 C:\libs C:\dev-libs"
+REM Define the fallback search directories. Used only when `where` is NOT
+REM available, or when a tool cannot be found on PATH.
+set "SEARCH_DIRS=C:\msys64 C:\tools\msys64 C:\Program Files\CMake\bin C:\Program Files\CMake C:\Program Files\Git\mingw64 C:\DevKit\mingw64 C:\DevKit\mingw32 C:\libs C:\dev-libs C:\"
 
-REM Add environment variable paths if they exist
-if defined LIB (
-    for %%P in (%LIB%) do (
-        if exist "%%P" (
-            for %%D in ("%%P") do (
-                if not "%%~fD"=="%%P" set "SEARCH_DIRS=!SEARCH_DIRS! %%~fD"
-            )
-        )
-    )
+REM Where.exe is present on normal Windows; if it isn't, we go straight to
+REM the directory search in :find_tool (at the bottom of this file).
+set "HAVE_WHERE="
+where where >nul 2>&1 && set "HAVE_WHERE=1"
+
+REM --------------------------------------------------------------
+REM 1. Locate the tools (mirrors find_tool in build.sh).
+REM --------------------------------------------------------------
+call :find_tool cmake
+set "CMAKE=!TOOL_FOUND!"
+
+set "PKGCONFIG="
+call :find_tool pkg-config
+if defined TOOL_FOUND set "PKGCONFIG=!TOOL_FOUND!"
+if not defined PKGCONFIG (
+    call :find_tool pkgconf
+    if defined TOOL_FOUND set "PKGCONFIG=!TOOL_FOUND!"
 )
 
-set "CURL_DIR="
-set "CURL_NAME="
-REM Enhanced library names for curl
-for %%D in (%SEARCH_DIRS%) do (
-    for %%N in (libcurl.dll.a libcurl.lib libcurl_imp.lib) do (
-        if not defined CURL_DIR if exist "%%~D\lib\%%N" (
-            set "CURL_DIR=%%~D\lib"
-            set "CURL_NAME=%%N"
-        )
-        if not defined CURL_DIR if exist "%%~D\%%N" (
-            set "CURL_DIR=%%~D"
-            set "CURL_NAME=%%N"
-        )
-    )
+set "CXX="
+call :find_tool g++
+if defined TOOL_FOUND set "CXX=!TOOL_FOUND!"
+if not defined CXX (
+    call :find_tool clang++
+    if defined TOOL_FOUND set "CXX=!TOOL_FOUND!"
 )
 
-set "GIT2_DIR="
-set "GIT2_NAME="
-REM Enhanced library names for git2
-for %%D in (%SEARCH_DIRS%) do (
-    for %%N in (libgit2.dll.a libgit2.lib) do (
-        if not defined GIT2_DIR if exist "%%~D\lib\%%N" (
-            set "GIT2_DIR=%%~D\lib"
-            set "GIT2_NAME=%%N"
-        )
-        if not defined GIT2_DIR if exist "%%~D\%%N" (
-            set "GIT2_DIR=%%~D"
-            set "GIT2_NAME=%%N"
-        )
+REM --------------------------------------------------------------
+REM 2. Preferred path: CMake (mirror of build.sh).
+REM --------------------------------------------------------------
+if defined CMAKE (
+    echo [INFO] Found CMake: configuring, building and testing with it.
+    echo [INFO] Configure...
+    "!CMAKE!" -S ".." -B "build" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+    if errorlevel 1 (
+        echo [ERROR] CMake configure failed.
+        exit /b 1
     )
+    echo [INFO] Build...
+    "!CMAKE!" --build build --parallel
+    if errorlevel 1 (
+        echo [ERROR] CMake build failed.
+        exit /b 1
+    )
+    set "CTEST="
+    call :find_tool ctest
+    if defined TOOL_FOUND set "CTEST=!TOOL_FOUND!"
+    if defined CTEST (
+        "!CTEST!" --test-dir build --output-on-failure
+    ) else (
+        echo [WARN] ctest not found; built successfully but tests not run.
+    )
+    echo Build successful! Executable: build\github_secrets_watcher.exe
+    exit /b 0
 )
 
-if not defined CURL_DIR (
-    echo Error: libcurl library not found
+REM --------------------------------------------------------------
+REM 3. Fallback: direct compilation via pkg-config (mirror of
+REM    build.sh). pkg-config lists the transitive link dependencies
+REM    that bare -l flags omit.
+REM --------------------------------------------------------------
+if not defined PKGCONFIG (
+    echo [ERROR] Neither CMake nor pkg-config/pkgconf was found on PATH.
+    echo         Install a CMake toolchain or pkg-config plus the compiler.
     exit /b 1
 )
-if not defined GIT2_DIR (
-    echo Error: libgit2 library not found
+if not defined CXX (
+    echo [ERROR] No C++ compiler found on PATH ^(g++ or clang++^).
     exit /b 1
 )
 
-set "CURL_PREFIX=!CURL_DIR!"
-if "!CURL_PREFIX:~-4!"=="\lib" set "CURL_PREFIX=!CURL_PREFIX:~0,-4!"
-set "LIBURL_LIBDIR=!CURL_PREFIX!\lib"
-set "LIBURL_INCLUDE=!CURL_PREFIX!\include"
-
-set "GIT2_PREFIX=!GIT2_DIR!"
-if "!GIT2_PREFIX:~-4!"=="\lib" set "GIT2_PREFIX=!GIT2_PREFIX:~0,-4!"
-set "LIBGIT2_LIBDIR=!GIT2_PREFIX!\lib"
-set "LIBGIT2_INCLUDE=!GIT2_PREFIX!\include"
-
-if "!CURL_NAME:~-6!"==".dll.a" (set "CURL_LINK_FLAG=-lcurl") else (set "CURL_LINK_FLAG=libcurl.lib")
-if "!GIT2_NAME:~-6!"==".dll.a" (set "GIT2_LINK_FLAG=-lgit2") else (set "GIT2_LINK_FLAG=libgit2.lib")
-set "LINKER_LIBS=!CURL_LINK_FLAG! !GIT2_LINK_FLAG!"
-
-set "compiler="
-for %%C in (g++ clang++ cl) do (
-    if not defined compiler (
-        where %%C >nul 2>&1
-        if not errorlevel 1 set "compiler=%%C"
-    )
-)
-if not defined compiler (
-    echo Error: No suitable compiler found ^(g++, clang++, or cl^)
-    exit /b 1
-)
-echo Using compiler: !compiler!
-
-if "!compiler!"=="cl" (
-    set "COMPILE_CMD=!compiler! /std:c++20 /W3 /I"!LIBURL_INCLUDE!" /I"!LIBGIT2_INCLUDE!" /I"!SRC_DIR!" /LIBPATH:"!LIBURL_LIBDIR!" /LIBPATH:"!LIBGIT2_LIBDIR!" !SRC_DIR!\main.cpp !SRC_DIR!\github.cpp !SRC_DIR!\scanner.cpp !SRC_DIR!\utils.cpp !LINKER_LIBS! /Fe:github_secrets_watcher.exe"
-) else (
-    set "COMPILE_CMD=!compiler! -std=c++20 -Wall -Wextra -I"!SRC_DIR!" -I"!LIBURL_INCLUDE!" -I"!LIBGIT2_INCLUDE!" -L"!LIBURL_LIBDIR!" -L"!LIBGIT2_LIBDIR!" !SRC_DIR!/main.cpp !SRC_DIR!/github.cpp !SRC_DIR!/scanner.cpp !SRC_DIR!/utils.cpp !LINKER_LIBS! -o github_secrets_watcher"
-)
-
-!COMPILE_CMD!
+"!PKGCONFIG!" --exists libcurl libgit2 2>nul
 if errorlevel 1 (
-    echo Build failed.
+    echo [ERROR] libcurl/libgit2 developer files not found via pkg-config.
+    echo         Install them, e.g. on MSYS2:
+    echo         pacman -S mingw-w64-x86_64-curl mingw-w64-x86_64-libgit2
     exit /b 1
 )
-setlocal DisableDelayedExpansion
-echo Build successful! Executable: github_secrets_watcher
+
+set "CFLAGS_FILE=%TEMP%\gsw_cflags.txt"
+set "LIBS_FILE=%TEMP%\gsw_libs.txt"
+"!PKGCONFIG!" --cflags libcurl libgit2 > "!CFLAGS_FILE!"
+"!PKGCONFIG!" --libs   libcurl libgit2 > "!LIBS_FILE!"
+set "CFLAGS="
+set "LIBS="
+set /p CFLAGS=<"!CFLAGS_FILE!"
+set /p LIBS=<"!LIBS_FILE!"
+del "!CFLAGS_FILE!" "!LIBS_FILE!" 2>nul
+
+echo [INFO] Compiler: !CXX!  via: !PKGCONFIG!
+"!CXX!" -std=c++20 -Wall -Wextra -I"!SRC_DIR!" !CFLAGS! ^
+    "!SRC_DIR!\main.cpp" "!SRC_DIR!\github.cpp" "!SRC_DIR!\scanner.cpp" "!SRC_DIR!\utils.cpp" ^
+    !LIBS! -o github_secrets_watcher.exe
+if errorlevel 1 (
+    echo [ERROR] Build failed.
+    exit /b 1
+)
+
+echo Build successful! Executable: github_secrets_watcher.exe
+echo Note: the unit tests need CMake ^(find_package Catch2^); this manual
+echo       build produced the CLI only. Prefer the CMake path above.
+exit /b 0
+
+REM ==============================================================
+REM :find_tool <name>  ->  sets TOOL_FOUND to the tool (or a path).
+REM Tries `where` first; if that fails (or where is missing) it falls
+REM back to guessing several well-known directories.
+REM ==============================================================
+:find_tool
+set "TOOL_FOUND="
+if defined HAVE_WHERE (
+    where %~1 >nul 2>&1 && set "TOOL_FOUND=%~1"
+)
+if not defined TOOL_FOUND (
+    for %%D in (%SEARCH_DIRS%) do (
+        if not defined TOOL_FOUND if exist "%%~D\%~1.exe"      set "TOOL_FOUND=%%~D\%~1.exe"
+        if not defined TOOL_FOUND if exist "%%~D\bin\%~1.exe"  set "TOOL_FOUND=%%~D\bin\%~1.exe"
+        if not defined TOOL_FOUND if exist "%%~D\mingw64\bin\%~1.exe" set "TOOL_FOUND=%%~D\mingw64\bin\%~1.exe"
+        if not defined TOOL_FOUND if exist "%%~D\ucrt64\bin\%~1.exe"  set "TOOL_FOUND=%%~D\ucrt64\bin\%~1.exe"
+        if not defined TOOL_FOUND if exist "%%~D\mingw32\bin\%~1.exe" set "TOOL_FOUND=%%~D\mingw32\bin\%~1.exe"
+    )
+)
 exit /b 0
