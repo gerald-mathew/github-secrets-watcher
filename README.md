@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <img alt="CI" src="https://github.com/Gerald-Mathew/Github-Secrets-Watcher/actions/workflows/ci.yml/badge.svg">
+  <img alt="CI" src="https://github.com/gerald-mathew/Github-Secrets-Watcher/actions/workflows/ci.yml/badge.svg">
 </p>
 
 ---
@@ -165,13 +165,13 @@ Repository: CareConnect-Clinic-Appointment-System
   Status: Success
   Found 6 potential environment/configuration files:
     - client/vite.config.js
-      [LINK] https://github.com/Gerald-Mathew/CareConnect-Clinic-Appointment-System/blob/1008a4e37c20daa635b148a2094a9966263c6fd0/client%2fvite.config.js
+      [LINK] https://github.com/gerald-mathew/CareConnect-Clinic-Appointment-System/blob/1008a4e37c20daa635b148a2094a9966263c6fd0/client%2fvite.config.js
 ```
 
 ```json
 [{
   "repo_name": "StudySync",
-  "html_url": "https://github.com/Gerald-Mathew/StudySync",
+  "html_url": "https://github.com/gerald-mathew/StudySync",
   "success": true,
   "files": [
     {"path": "client/assets/js/config.js", "commit_hash": "6c6d6a7d...", "likely_secret": false}
