@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <img alt="CI" src="https://github.com/gerald-mathew/Github-Secrets-Watcher/actions/workflows/ci.yml/badge.svg">
+  <img alt="CI" src="https://github.com/gerald-mathew/github-secrets-watcher/actions/workflows/ci.yml/badge.svg">
 </p>
 
 ---
